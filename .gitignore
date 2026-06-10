@@ -72,6 +72,8 @@ examples/*.gif
 ehthumbs.db
 Thumbs.db
 
+dataset/
+
 .env
 
 # Local untracked files and model weights

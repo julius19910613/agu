@@ -39,6 +39,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torchvision import models
 from torch.utils.data import DataLoader, random_split
+from torch.utils.data._utils.collate import default_collate
 
 from dataset import BasketballDataset
 from utils.checkpoints import init_session_history, save_weights, load_weights, write_history, read_history
@@ -49,6 +50,50 @@ LABELS = {
     0: "block", 1: "pass", 2: "run", 3: "dribble", 4: "shoot",
     5: "ball in hand", 6: "defense", 7: "pick", 8: "no_action", 9: "walk",
 }
+
+
+class SafeDataset(torch.utils.data.Dataset):
+    """Wrap another dataset and convert __getitem__ exceptions into skip markers."""
+
+    def __init__(self, dataset, phase_name=""):
+        self.dataset = dataset
+        self.phase_name = phase_name
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        try:
+            return self.dataset[idx]
+        except Exception as exc:
+            return {
+                "_dataset_error": True,
+                "_dataset_error_index": idx,
+                "_dataset_error_phase": self.phase_name,
+                "_dataset_error_msg": str(exc),
+            }
+
+
+def make_safe_collate_fn():
+    """Drop failed samples from a batch, and return a marker batch if all are invalid."""
+
+    def safe_collate_fn(batch):
+        valid_samples = []
+        skip_count = 0
+        for sample in batch:
+            if isinstance(sample, dict) and sample.get("_dataset_error"):
+                skip_count += 1
+                continue
+            valid_samples.append(sample)
+
+        if not valid_samples:
+            return {"_skip_batch": True, "_skip_count": skip_count}
+
+        collated = default_collate(valid_samples)
+        collated["_skip_count"] = skip_count
+        return collated
+
+    return safe_collate_fn
 
 # Graceful shutdown flag
 _shutdown_requested = False
@@ -114,7 +159,19 @@ def validate_bn_stats(model):
     return len(issues) == 0
 
 
-def train_model(model, dataloaders, criterion, optimizer, device, args, start_epoch=1, num_epochs=20):
+def train_model(
+    model,
+    dataloaders,
+    criterion,
+    optimizer,
+    device,
+    args,
+    start_epoch=1,
+    num_epochs=20,
+    initial_best_acc=-1.0,
+    initial_best_epoch=None,
+    initial_best_weights=None,
+):
     """Train and validate the model with error recovery and memory management."""
     init_session_history(args)
     since = time.time()
@@ -124,8 +181,13 @@ def train_model(model, dataloaders, criterion, optimizer, device, args, start_ep
     train_f1_score, val_f1_score = [], []
     plot_epoch = []
 
-    best_model_wts = copy.deepcopy(model.state_dict())
-    best_acc = 0.0
+    best_model_wts = copy.deepcopy(initial_best_weights) if initial_best_weights is not None else None
+    best_optimizer_state = None
+    best_acc = float(initial_best_acc)
+    best_epoch = initial_best_epoch
+    best_updated_this_run = False
+    trained_any_epoch = False
+
     # Initialize to avoid unbound warnings
     train_loss = val_loss = 0.0
     train_accuracy = val_accuracy = 0.0
@@ -159,6 +221,14 @@ def train_model(model, dataloaders, criterion, optimizer, device, args, start_ep
 
             pbar = tqdm(dataloaders[phase], desc=f"{phase} epoch {epoch}")
             for sample in pbar:
+                if isinstance(sample, dict) and sample.get("_skip_batch"):
+                    skip_count += int(sample.get("_skip_count", 0))
+                    continue
+
+                skip_count += int(sample.get("_skip_count", 0))
+                if "_skip_count" in sample:
+                    del sample["_skip_count"]
+
                 try:
                     inputs = safe_to_device(sample["video"].float(), device)
                     labels = safe_to_device(sample["action"].float(), device)
@@ -209,6 +279,9 @@ def train_model(model, dataloaders, criterion, optimizer, device, args, start_ep
                 print(f"  ⚠️  No valid samples in {phase} this epoch (all skipped)")
                 continue
 
+            if phase == "train":
+                trained_any_epoch = True
+
             epoch_loss = running_loss / n_samples
             epoch_acc = running_corrects / n_samples
             pred_arr = np.asarray(pred_classes)
@@ -232,14 +305,18 @@ def train_model(model, dataloaders, criterion, optimizer, device, args, start_ep
 
                 if epoch_acc > best_acc:
                     best_acc = epoch_acc
+                    best_epoch = epoch
                     best_model_wts = copy.deepcopy(model.state_dict())
+                    best_optimizer_state = copy.deepcopy(optimizer.state_dict())
+                    best_updated_this_run = True
                     # Save best checkpoint immediately
                     os.makedirs(args.model_path, exist_ok=True)
                     best_path = os.path.join(args.model_path, "best.pt")
                     torch.save({
                         "epoch": epoch,
+                        "best_epoch": best_epoch,
                         "state_dict": model.state_dict(),
-                        "optimizer": optimizer.state_dict(),
+                        "optimizer": best_optimizer_state,
                         "best_val_acc": best_acc,
                     }, best_path)
                     print(f"  🏆 New best val acc: {best_acc:.4f} — saved to {best_path}")
@@ -260,18 +337,24 @@ def train_model(model, dataloaders, criterion, optimizer, device, args, start_ep
         if epoch % 5 == 0:
             validate_bn_stats(model)
 
-        # Save epoch checkpoint (for resume)
-        os.makedirs(args.model_path, exist_ok=True)
-        model_name = save_weights(model, args, epoch, optimizer)
+        if not args.save_best_only:
+            # Save epoch checkpoint (for resume)
+            os.makedirs(args.model_path, exist_ok=True)
+            model_name = save_weights(model, args, epoch, optimizer)
 
-        # Also save a latest.pt for easy resume
-        latest_path = os.path.join(args.model_path, "latest.pt")
-        torch.save({
-            "epoch": epoch,
-            "state_dict": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "best_val_acc": best_acc,
-        }, latest_path)
+            # Also save a latest.pt for easy resume
+            latest_path = os.path.join(args.model_path, "latest.pt")
+            torch.save({
+                "epoch": epoch,
+                "state_dict": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "best_val_acc": best_acc,
+                "best_epoch": best_epoch,
+                "best_state_dict": best_model_wts,
+                "best_optimizer": best_optimizer_state,
+            }, latest_path)
+        else:
+            model_name = "best.pt"
 
         write_history(
             args.history_path, model_name,
@@ -287,18 +370,25 @@ def train_model(model, dataloaders, criterion, optimizer, device, args, start_ep
     print(f"\nTraining complete in {time_elapsed // 60:.0f}m {time_elapsed % 60:.0f}s")
     print(f"Best val Acc: {best_acc:.4f}")
 
-    # Load best weights
-    model.load_state_dict(best_model_wts)
+    if trained_any_epoch and best_model_wts is not None:
+        # Load best weights from the best epoch available in this run.
+        model.load_state_dict(best_model_wts)
 
-    # Final best checkpoint save
-    best_path = os.path.join(args.model_path, "best.pt")
-    torch.save({
-        "epoch": num_epochs,
-        "state_dict": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "best_val_acc": best_acc,
-    }, best_path)
-    print(f"Best model saved to {best_path}")
+        if best_updated_this_run:
+            # Final best checkpoint save keeps weights and optimizer from the same best epoch.
+            best_path = os.path.join(args.model_path, "best.pt")
+            torch.save({
+                "epoch": best_epoch,
+                "state_dict": best_model_wts,
+                "optimizer": best_optimizer_state or optimizer.state_dict(),
+                "best_val_acc": best_acc,
+                "best_epoch": best_epoch,
+            }, best_path)
+            print(f"Best model saved to {best_path}")
+        else:
+            print("  Note: No validation improvement; existing best checkpoint was not overwritten.")
+    else:
+        print("  Note: No valid epoch completed; best checkpoint was not overwritten.")
 
     # Validate final BN stats
     if validate_bn_stats(model):
@@ -315,6 +405,14 @@ def check_accuracy(loader, model, device):
     skip_count = 0
     with torch.no_grad():
         for sample in tqdm(loader, desc="Testing"):
+            if isinstance(sample, dict) and sample.get("_skip_batch"):
+                skip_count += int(sample.get("_skip_count", 0))
+                continue
+
+            skip_count += int(sample.get("_skip_count", 0))
+            if "_skip_count" in sample:
+                del sample["_skip_count"]
+
             try:
                 x = safe_to_device(sample["video"].float(), device)
                 y = safe_to_device(sample["action"].float(), device)
@@ -416,6 +514,9 @@ def main():
 
     # Resume from checkpoint if specified
     ckpt = None
+    best_acc_so_far = -1.0
+    best_epoch_so_far = None
+    best_weights_for_resume = None
     if args.resume:
         resume_path = args.resume
         if not os.path.exists(resume_path):
@@ -432,7 +533,13 @@ def main():
             if "epoch" in ckpt:
                 args.start_epoch = ckpt["epoch"] + 1
                 print(f"  Resuming from epoch {args.start_epoch}")
-            best_acc_so_far = ckpt.get("best_val_acc", 0)
+            best_acc_so_far = ckpt.get("best_val_acc", -1.0)
+            best_epoch_so_far = ckpt.get("best_epoch", ckpt.get("epoch"))
+            best_state_from_ckpt = ckpt.get("best_state_dict")
+            if isinstance(best_state_from_ckpt, dict):
+                best_weights_for_resume = copy.deepcopy(best_state_from_ckpt)
+            elif ckpt.get("epoch") == best_epoch_so_far:
+                best_weights_for_resume = copy.deepcopy(ckpt.get("state_dict"))
             print(f"  Best val acc so far: {best_acc_so_far:.4f}")
         else:
             print(f"⚠️  Checkpoint not found at {resume_path}, starting from scratch")
@@ -470,17 +577,30 @@ def main():
         generator=torch.Generator().manual_seed(1),
     )
 
-    train_loader = DataLoader(train_subset, shuffle=True,
-                              batch_size=args.batch_size,
-                              num_workers=args.num_workers,
-                              pin_memory=(device.type == "cuda"))
-    val_loader = DataLoader(val_subset, shuffle=False,
-                            batch_size=args.batch_size,
-                            num_workers=args.num_workers,
-                            pin_memory=(device.type == "cuda"))
-    test_loader = DataLoader(test_subset, shuffle=False,
-                             batch_size=args.batch_size,
-                             num_workers=args.num_workers)
+    safe_collate_fn = make_safe_collate_fn()
+    train_loader = DataLoader(
+        SafeDataset(train_subset, "train"),
+        shuffle=True,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        collate_fn=safe_collate_fn
+    )
+    val_loader = DataLoader(
+        SafeDataset(val_subset, "val"),
+        shuffle=False,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        collate_fn=safe_collate_fn
+    )
+    test_loader = DataLoader(
+        SafeDataset(test_subset, "test"),
+        shuffle=False,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        collate_fn=safe_collate_fn
+    )
     dataloaders = {"train": train_loader, "val": val_loader}
 
     print(f"DataLoader ready — batch_size={args.batch_size}, workers={args.num_workers}")
@@ -490,6 +610,9 @@ def main():
         model, dataloaders, criterion, optimizer, device, args,
         start_epoch=args.start_epoch,
         num_epochs=args.epochs,
+        initial_best_acc=best_acc_so_far,
+        initial_best_epoch=best_epoch_so_far,
+        initial_best_weights=best_weights_for_resume,
     )
 
     # ── Test ────────────────────────────────────────────────────────
