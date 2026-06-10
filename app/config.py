@@ -21,9 +21,9 @@ class Settings(BaseSettings):
     )
 
     # --- Model checkpoint ---
-    model_path: str = "model_checkpoints/r2plus1d_augmented-2/"
-    base_model_name: str = "r2plus1d_multiclass"
-    start_epoch: int = 19
+    model_path: str = "model_checkpoints/r2plus1d_v3/"
+    base_model_name: str = "best"
+    start_epoch: int = 0
     lr: float = 0.0001
     num_classes: int = 10
 

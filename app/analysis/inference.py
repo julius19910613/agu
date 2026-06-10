@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 from app.analysis.schemas import ModelPrediction
+from app.models.preprocessing import preprocess_clip_frames
 
 # Label configuration from hybrid_analysis.py
 LABELS: Dict[int, str] = {
@@ -24,24 +25,27 @@ LABELS: Dict[int, str] = {
 LABEL_TO_ID = {value: key for key, value in LABELS.items()}
 
 
-def inference_batch(batch: torch.Tensor) -> torch.Tensor:
+def inference_batch(batch: torch.Tensor | np.ndarray) -> torch.Tensor:
     """Prepare a batch of clips for R(2+1)D model inference.
 
-    Converts BGR→RGB, normalizes pixel values to [0, 1] (matching training
-    preprocessing in dataset.py VideoToTensor), and permutes to (B, C, T, H, W).
+    Applies the same unified preprocessing as the training pipeline:
+    - Converts BGR frames to RGB
+    - Resizes frames to 112x112
+    - Divides by 255
+    - Normalizes to Kinetics-400 mean and standard deviation
 
     Args:
-        batch: Tensor of shape (B, T, H, W, C) with BGR uint8 pixel values.
+        batch: Batch of clips with shape `(B, T, H, W, C)` in BGR `[0, 255]`.
 
     Returns:
-        Tensor of shape (B, C, T, H, W) with RGB float32 values in [0, 1].
+        Tensor of shape `(B, C, T, 112, 112)` in normalized RGB float32.
     """
-    # BGR → RGB: reverse the channel dimension
-    batch = batch.flip(-1)
-    # Normalize to [0, 1] to match training preprocessing (dataset.py L191: frames /= 255)
-    batch = batch.float() / 255.0
-    # (B, T, H, W, C) → (B, C, T, H, W)
-    return batch.permute(0, 4, 1, 2, 3)
+    batch_np = batch.detach().cpu().numpy() if isinstance(batch, torch.Tensor) else np.asarray(batch)
+    processed_clips = [
+        preprocess_clip_frames(list(clip_frames))
+        for clip_frames in batch_np
+    ]
+    return torch.from_numpy(np.stack(processed_clips, axis=0)).float()
 
 
 def predict_player_clips(
@@ -68,7 +72,7 @@ def predict_player_clips(
         predictions: List[ModelPrediction] = []
         for start in range(0, len(clips), batch_size):
             batch_np = np.asarray(clips[start : start + batch_size])
-            batch = inference_batch(torch.FloatTensor(batch_np)).to(device)
+            batch = inference_batch(batch_np).to(device)
             with torch.no_grad():
                 outputs = model(batch)
                 softmax = torch.softmax(outputs, dim=1).detach().cpu().numpy()

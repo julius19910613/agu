@@ -3,15 +3,73 @@ import json
 import numpy as np
 import cv2
 import os
+import random
 
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
 
+from app.models.preprocessing import preprocess_clip_numpy
+
+
+class VideoTransform:
+    """Video augmentation transforms for training.
+
+    Operates on numpy arrays of shape (C, T, H, W).
+    """
+
+    def __init__(self, mode='train', target_size=112):
+        self.mode = mode
+        self.target_size = target_size
+
+    def __call__(self, clip):
+        """Transform a clip to the requested spatial size."""
+        if self.mode == 'train':
+            return self._train_transform(clip)
+        return self._val_transform(clip)
+
+    def _train_transform(self, clip):
+        c, t, h, w = clip.shape
+        target = self.target_size
+
+        scale = random.uniform(0.8, 1.0)
+        crop_h, crop_w = int(h * scale), int(w * scale)
+        top = random.randint(0, h - crop_h)
+        left = random.randint(0, w - crop_w)
+
+        result = np.empty((c, t, target, target), dtype=clip.dtype)
+        for frame_idx in range(t):
+            frame = clip[:, frame_idx, top:top + crop_h, left:left + crop_w]
+            frame_hw = frame.transpose(1, 2, 0)
+            frame_hw = cv2.resize(frame_hw, (target, target), interpolation=cv2.INTER_LINEAR)
+            result[:, frame_idx, :, :] = frame_hw.transpose(2, 0, 1)
+
+        if random.random() < 0.5:
+            result = result[:, :, :, ::-1].copy()
+
+        if random.random() < 0.3:
+            brightness = random.uniform(0.85, 1.15)
+            contrast = random.uniform(0.85, 1.15)
+            if result.max() > 10:
+                result = np.clip(result * brightness * contrast, 0, 255).astype(np.float32)
+
+        return result
+
+    def _val_transform(self, clip):
+        c, t, _, _ = clip.shape
+        target = self.target_size
+        result = np.empty((c, t, target, target), dtype=clip.dtype)
+        for frame_idx in range(t):
+            frame = clip[:, frame_idx, :, :]
+            frame_hw = frame.transpose(1, 2, 0)
+            frame_hw = cv2.resize(frame_hw, (target, target), interpolation=cv2.INTER_LINEAR)
+            result[:, frame_idx, :, :] = frame_hw.transpose(2, 0, 1)
+        return result
+
 class BasketballDataset(Dataset):
     """SpaceJam: a Dataset for Basketball Action Recognition."""
 
-    def __init__(self, annotation_dict, augmented_dict=None, video_dir="dataset/examples/", augmented_dir="dataset/augmented-examples/", augment=True, transform=None, poseData=False):
+    def __init__(self, annotation_dict, augmented_dict=None, video_dir="dataset/examples/", augmented_dir="dataset/augmented-examples/", augment=True, transform=None, poseData=False, preprocess=False, target_size=112):
         with open(annotation_dict) as f:
             self.video_list = list(json.load(f).items())
 
@@ -31,6 +89,8 @@ class BasketballDataset(Dataset):
         self.video_dir = video_dir
         self.poseData = poseData
         self.transform = transform
+        self.preprocess = preprocess
+        self.target_size = target_size
 
     def __len__(self):
         # return length of none-flipped videos in directory
@@ -44,6 +104,8 @@ class BasketballDataset(Dataset):
             sample = {'video_id': video_id, 'joints': joints, 'action': torch.from_numpy(np.array(encoding[self.video_list[idx][1]])), 'class': self.video_list[idx][1]}
         else:
             video = self.VideoToNumpy(video_id)
+            if self.transform is not None:
+                video = self.transform(video)
             sample = {'video_id': video_id, 'video': torch.from_numpy(video).float(), 'action': torch.from_numpy(np.array(encoding[self.video_list[idx][1]])), 'class': self.video_list[idx][1]}
 
         return sample
@@ -72,7 +134,10 @@ class BasketballDataset(Dataset):
 
         video.release()
         assert len(video_frames) == 16
-        return np.transpose(np.asarray(video_frames), (1,0,2,3))
+        clip = np.transpose(np.asarray(video_frames), (1,0,2,3))
+        if self.preprocess:
+            return preprocess_clip_numpy(clip, self.target_size)
+        return clip
 
 class BasketballDatasetTensor(Dataset):
     """SpaceJam: a Dataset for Basketball Action Recognition."""
@@ -198,7 +263,7 @@ def VideoToTensor(video_id, data_dir="dataset/examples/", output_dir="tensor-dat
     cap.release()
     torch.save(frames, output_dir + video_id + ".pt")
 
-def VideoToNumpy(video_id, data_dir="dataset/examples/", output_dir="numpy-dataset/"):
+def VideoToNumpy(video_id, data_dir="dataset/examples/", output_dir="numpy-dataset/", preprocess=False, target_size=112):
     # get video
     video = cv2.VideoCapture(data_dir+video_id+".mp4")
 
@@ -218,7 +283,10 @@ def VideoToNumpy(video_id, data_dir="dataset/examples/", output_dir="numpy-datas
 
     video.release()
     assert len(video_frames) == 16
-    np.save(output_dir+video_id+".npy", np.transpose(np.asarray(video_frames), (1,0,2,3)))
+    clip = np.transpose(np.asarray(video_frames), (1,0,2,3))
+    if preprocess:
+        clip = preprocess_clip_numpy(clip, target_size)
+    np.save(output_dir+video_id+".npy", clip)
 
 def convertAllVideoTensor(path="dataset/annotation_dict.json", data_dir="dataset/examples/", output_dir="tensor-dataset/"):
     # Let's convert all video to .pt files
