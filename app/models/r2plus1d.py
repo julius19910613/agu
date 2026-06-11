@@ -47,9 +47,28 @@ def build_r2plus1d_model(
         logger.info("Loading best checkpoint from %s", best_path)
         checkpoint = torch.load(best_path, map_location="cpu", weights_only=False)
         state_dict = checkpoint["state_dict"]
-        # Filter to only keys that exist in the current model (skip mismatches)
         model_dict = model.state_dict()
-        loaded = {k: v for k, v in state_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
+
+        # Remap fc keys: train_mac.py may wrap fc as nn.Sequential(Dropout, Linear)
+        # producing keys like "fc.1.weight" vs the plain "fc.weight" stored in older
+        # checkpoints.  Handle both directions transparently.
+        remapped: dict[str, torch.Tensor] = {}
+        for k, v in state_dict.items():
+            # Old ckpt → new model:  fc.weight → fc.1.weight
+            if k.startswith("fc.") and k not in model_dict:
+                candidate = k.replace("fc.", "fc.1.", 1)
+                if candidate in model_dict and v.shape == model_dict[candidate].shape:
+                    remapped[candidate] = v
+                    continue
+            # New ckpt → old model:  fc.1.weight → fc.weight
+            if k.startswith("fc.1.") and k not in model_dict:
+                candidate = k.replace("fc.1.", "fc.", 1)
+                if candidate in model_dict and v.shape == model_dict[candidate].shape:
+                    remapped[candidate] = v
+                    continue
+            remapped[k] = v
+
+        loaded = {k: v for k, v in remapped.items() if k in model_dict and v.shape == model_dict[k].shape}
         model_dict.update(loaded)
         model.load_state_dict(model_dict)
         logger.info(
