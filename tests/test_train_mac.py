@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import numpy as np
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
@@ -300,8 +301,8 @@ class TrainMacTests(TestCase):
             model_dir = os.path.join(tmpdir, "model_checkpoints")
             history_path = os.path.join(tmpdir, "history.txt")
 
-            random_split_calls = []
             fake_dataset_args = {}
+            stratified_calls = []
 
             class FakeDataset:
                 def __init__(self, annotation_dict, augmented_dict, video_dir="dataset/examples/",
@@ -344,9 +345,33 @@ class TrainMacTests(TestCase):
                 def r2plus1d_18(weights=None):
                     return FakeModel()
 
-            def fake_random_split(dataset, lengths, generator=None):
-                random_split_calls.append(list(lengths))
-                return dataset, dataset
+            weighted_sampler_calls = []
+
+            class FakeWeightedRandomSampler(list):
+                def __init__(self, weights, num_samples, replacement=True):
+                    weighted_sampler_calls.append((tuple(weights.tolist()), int(num_samples), replacement))
+                    super().__init__(range(num_samples))
+
+            class FakeStratifiedSplit:
+                def __init__(self, n_splits, test_size, random_state=None):
+                    stratified_calls.append({
+                        "n_splits": n_splits,
+                        "test_size": test_size,
+                        "random_state": random_state,
+                    })
+
+                def split(self, indices, labels):
+                    if len(stratified_calls) == 1:
+                        n = len(indices)
+                        train_val = np.arange(n - int(len(indices) * 0.1))
+                        test = np.arange(n - int(len(indices) * 0.1), n)
+                    else:
+                        n = len(indices)
+                        val_count = int(round(n * 0.222))
+                        val = np.arange(val_count)
+                        train = np.arange(val_count, n)
+                        return iter(((train, val),))
+                    return iter(((train_val, test),))
 
             args = SimpleNamespace(
                 device="cpu",
@@ -369,7 +394,9 @@ class TrainMacTests(TestCase):
             with patch("train_mac.parse_args", return_value=args), \
                 patch("train_mac.auto_device", return_value=torch.device("cpu")), \
                 patch("train_mac.BasketballDataset", FakeDataset), \
-                patch("train_mac.random_split", fake_random_split), \
+                patch("train_mac.StratifiedShuffleSplit", FakeStratifiedSplit), \
+                patch("train_mac.WeightedRandomSampler", FakeWeightedRandomSampler), \
+                patch("train_mac.random_split", side_effect=AssertionError("train_mac should not use random_split anymore")), \
                 patch("train_mac.train_model", return_value=(FakeModel(), [], [], [], [], [], [], [])), \
                 patch("train_mac.check_accuracy"), \
                 patch("train_mac.models.video", FakeVideoModule):
@@ -380,8 +407,10 @@ class TrainMacTests(TestCase):
             self.assertEqual(fake_dataset_args["annotation_dict"], ann_path)
             self.assertEqual(fake_dataset_args["augmented_dict"], aug_path)
             self.assertFalse(os.path.exists(aug_path))
-            self.assertEqual(random_split_calls[0], [90, 10])
-            self.assertEqual(random_split_calls[1], [70, 20])
+            self.assertEqual(stratified_calls[0], {"n_splits": 1, "test_size": 0.1, "random_state": 42})
+            self.assertEqual(stratified_calls[1], {"n_splits": 1, "test_size": 0.222, "random_state": 42})
+            self.assertEqual(len(weighted_sampler_calls), 1)
+            self.assertEqual(weighted_sampler_calls[0][1], 70)
 
     def test_resume_noop_does_not_overwrite_best_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmpdir:

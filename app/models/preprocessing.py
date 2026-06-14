@@ -1,33 +1,22 @@
-"""Unified preprocessing for R(2+1)D basketball action recognition.
+"""Preprocessing helpers kept for the deployed v3 inference/training path.
 
-All three pipelines (train, val, inference) use these functions to ensure a
-consistent input distribution matching Kinetics-400 pretraining.
+The v3 deployment intentionally keeps video data in BGR order with value range
+`[0, 255]`, resizes spatially to `112x112`, and does no `/255` normalization or
+Kinetics mean/std normalization.
 """
 
 import cv2
 import numpy as np
 import torch
-from torchvision.transforms import Compose, Lambda
-
-# Kinetics-400 normalization constants (RGB)
-KINETICS_MEAN = [0.43216, 0.394666, 0.37645]
-KINETICS_STD = [0.22803, 0.22145, 0.216989]
 
 TARGET_SIZE = 112  # R(2+1)D expects 112x112 spatial input
 
 
 def bgr_to_rgb(frame: np.ndarray) -> np.ndarray:
-    """Convert a BGR frame to RGB.
-
-    Args:
-        frame: Frame array with shape `(H, W, 3)`.
-
-    Returns:
-        RGB frame with the same shape as the input.
-    """
+    """Return a BGR frame as-is while keeping a safe numeric range."""
     if frame.dtype != np.uint8:
         frame = np.clip(frame, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    return frame
 
 
 def resize_frame(frame: np.ndarray, size: int = TARGET_SIZE) -> np.ndarray:
@@ -44,24 +33,9 @@ def resize_frame(frame: np.ndarray, size: int = TARGET_SIZE) -> np.ndarray:
 
 
 def preprocess_frame(frame: np.ndarray, size: int = TARGET_SIZE) -> np.ndarray:
-    """Apply full preprocessing to a single frame.
-
-    Args:
-        frame: BGR frame with shape `(H, W, 3)` and values in `[0, 255]`.
-        size: Target height and width.
-
-    Returns:
-        Float32 RGB frame with shape `(size, size, 3)` normalized to the
-        Kinetics-400 distribution.
-    """
-    frame = bgr_to_rgb(frame)
+    """Resize one BGR frame for v3 without color change or normalization."""
     frame = resize_frame(frame, size)
-    frame = frame.astype(np.float32) / 255.0
-    for channel in range(3):
-        frame[:, :, channel] = (
-            frame[:, :, channel] - KINETICS_MEAN[channel]
-        ) / KINETICS_STD[channel]
-    return frame
+    return frame.astype(np.float32)
 
 
 def preprocess_clip_numpy(clip: np.ndarray, size: int = TARGET_SIZE) -> np.ndarray:
@@ -72,8 +46,7 @@ def preprocess_clip_numpy(clip: np.ndarray, size: int = TARGET_SIZE) -> np.ndarr
         size: Target height and width.
 
     Returns:
-        Float32 clip with shape `(C, T, size, size)` in RGB and normalized to
-        the Kinetics-400 distribution.
+        Float32 clip with shape `(C, T, size, size)` in BGR and range `[0, 255]`.
     """
     channels, num_frames, _, _ = clip.shape
     result = np.empty((channels, num_frames, size, size), dtype=np.float32)
@@ -90,28 +63,19 @@ def preprocess_clip_frames(
     frames: list[np.ndarray],
     size: int = TARGET_SIZE,
 ) -> np.ndarray:
-    """Preprocess a list of BGR frames from OpenCV.
-
-    Args:
-        frames: List of BGR uint8 frames, each with shape `(H, W, 3)`.
-        size: Target height and width.
-
-    Returns:
-        Float32 clip with shape `(3, T, size, size)` normalized to the
-        Kinetics-400 distribution.
-    """
+    """Preprocess a list of BGR frames from OpenCV for v3 inference."""
     num_frames = len(frames)
     result = np.empty((3, num_frames, size, size), dtype=np.float32)
 
     for frame_idx, frame in enumerate(frames):
-        processed = preprocess_frame(frame, size)
+        processed = preprocess_frame(bgr_to_rgb(frame), size)
         result[:, frame_idx, :, :] = processed.transpose(2, 0, 1)
 
     return result
 
 
 def _resize_video_tensor(x: torch.Tensor, size: int) -> torch.Tensor:
-    """Resize a `(C, T, H, W)` video tensor to the target spatial size."""
+    """Resize `(C, T, H, W)` while keeping v3 range and channel order."""
     x = x.unsqueeze(0)
     x = torch.nn.functional.interpolate(
         x,
@@ -123,23 +87,14 @@ def _resize_video_tensor(x: torch.Tensor, size: int) -> torch.Tensor:
 
 
 def _normalize_video_tensor(x: torch.Tensor) -> torch.Tensor:
-    """Normalize a `(C, T, H, W)` RGB video tensor to Kinetics statistics."""
-    if x.max() > 1.0:
-        x = x / 255.0
-    mean = torch.tensor(KINETICS_MEAN, dtype=x.dtype, device=x.device).view(3, 1, 1, 1)
-    std = torch.tensor(KINETICS_STD, dtype=x.dtype, device=x.device).view(3, 1, 1, 1)
-    return (x - mean) / std
+    """Keep v3 clip values unchanged; no mean/std normalization."""
+    return x
 
 
-def get_val_transforms(size: int = TARGET_SIZE) -> Compose:
-    """Build validation transforms for `(C, T, H, W)` video tensors.
+def get_val_transforms(size: int = TARGET_SIZE):
+    """Torchvision-compatible resize + no-op normalization transform."""
+    from torchvision.transforms import Compose, Lambda
 
-    Args:
-        size: Target height and width.
-
-    Returns:
-        A torchvision `Compose` that resizes and normalizes RGB video tensors.
-    """
     return Compose(
         [
             Lambda(lambda x: _resize_video_tensor(x, size)),

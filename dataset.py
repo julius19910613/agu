@@ -242,8 +242,6 @@ def VideoToTensor(video_id, data_dir="dataset/examples/", output_dir="tensor-dat
         ret, frame = cap.read()
         if ret:
             # successfully read frame
-            # BGR to RGB
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame = torch.from_numpy(frame)
             # (H x W x C) to (C x H x W)
             frame = frame.permute(2, 0, 1)
@@ -258,8 +256,6 @@ def VideoToTensor(video_id, data_dir="dataset/examples/", output_dir="tensor-dat
                 assert (index > 0)
                 frames[:, index:, :, :] = frames[:, index - 1, :, :].view(channels, 1, height, width)
             break
-
-    frames /= 255
     cap.release()
     torch.save(frames, output_dir + video_id + ".pt")
 

@@ -994,10 +994,9 @@ def main():
     print("Loading dataset...")
     if args.use_augmentation:
         train_transform = VideoTransform(mode='train', target_size=112)
-        val_transform = VideoTransform(mode='val', target_size=112)
     else:
-        train_transform = None
-        val_transform = None
+        train_transform = VideoTransform(mode='val', target_size=112)
+    val_transform = VideoTransform(mode='val', target_size=112)
 
     basketball_dataset = BasketballDataset(
         annotation_dict=args.annotation_path,
