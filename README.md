@@ -1,4 +1,4 @@
-# Basketball Defense Analysis
+# AGU
 
 - [中文版本](#中文版本)
 - [English Version](#english-version)
@@ -7,7 +7,7 @@
 
 ### 项目简介
 
-Basketball Defense Analysis 是一个篮球视频分析项目，组合了球员跟踪、片段级动作分类、简单运动特征和可选的本地 VLM 复核。
+AGU 是一个面向篮球视频的动作与比赛理解项目，组合了球员跟踪、片段级动作分类、简单运动特征和可选的本地 VLM 复核。
 
 当前仓库提供：
 
@@ -307,7 +307,7 @@ high_confidence           可选，覆盖高置信度阈值
 
 ### Overview
 
-Basketball Defense Analysis is a basketball video analysis project that combines player tracking, clip-level action classification, lightweight motion features, and optional local VLM review.
+AGU is a basketball action and game understanding project that combines player tracking, clip-level action classification, lightweight motion features, and optional local VLM review.
 
 This repository provides:
 
