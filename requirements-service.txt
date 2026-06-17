@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+pydantic-settings
+torch
+torchvision
+opencv-contrib-python-headless
+ultralytics
+scikit-learn
+tqdm
+easydict
+numpy
+Pillow
+ffmpeg-python

@@ -1,0 +1,10 @@
+{
+  "video_path": "examples/lebron_shoots.mp4",
+  "vlm_mode": "off",
+  "max_frames": 120,
+  "generate_video": false,
+  "tracker_conf_thres": 0.3,
+  "tracker_iou_thres": 0.6,
+  "tracker_min_appear_ratio": 0.02,
+  "tracker_min_appear_abs": 5
+}
