@@ -248,6 +248,7 @@ curl http://127.0.0.1:8765/health
 
 API 契约见 `docs/api.md`，模型说明见 `docs/model-card.md`。
 权重说明见 `docs/checkpoints.md`，扩展接口见 `docs/extensions.md`。
+公开发布来源、许可证、数据集与权重策略见 `docs/release-notes.md` 和 `docs/datasets.md`。
 
 ### 提交分析任务
 
@@ -370,6 +371,8 @@ high_confidence           可选，覆盖高置信度阈值
 
 - 贡献指南：`CONTRIBUTING.md`
 - 许可证：`LICENSE`
+- 公开发布说明：`docs/release-notes.md`
+- 数据集获取说明：`docs/datasets.md`
 
 当前已验证状态：
 

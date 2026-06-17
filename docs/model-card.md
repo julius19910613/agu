@@ -87,3 +87,9 @@ Do not rely only on overall accuracy. For basketball actions, report:
 ## Release Status
 
 This model card documents the current AGU v3 deployment contract. A public checkpoint and benchmark table should be added before a formal open-source release.
+
+## Source and License Notes
+
+The AGU source code is MIT-licensed. Model weights are not included in the repository and must declare their own license when published.
+
+Before distributing a checkpoint, verify that the training dataset license allows derived weight distribution. Include dataset source, dataset license, checkpoint checksum, and evaluation metrics with the release.

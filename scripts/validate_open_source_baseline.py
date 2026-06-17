@@ -53,9 +53,11 @@ def validate_docs() -> None:
         ROOT / "LICENSE",
         ROOT / "docs/api.md",
         ROOT / "docs/checkpoints.md",
+        ROOT / "docs/datasets.md",
         ROOT / "docs/extensions.md",
         ROOT / "docs/model-card.md",
         ROOT / "docs/open-source-scope-assessment.md",
+        ROOT / "docs/release-notes.md",
     ]
     for path in required_docs:
         require_file(path)
@@ -83,6 +85,16 @@ def validate_docs() -> None:
     for marker in ["Model Registry", "Tracker Registry", "Storage Backend"]:
         if marker not in extensions:
             raise AssertionError(f"docs/extensions.md missing marker: {marker}")
+
+    release_notes = (ROOT / "docs/release-notes.md").read_text(encoding="utf-8")
+    for marker in ["Source Statement", "License Statement", "Dataset Policy", "Weight Distribution Policy"]:
+        if marker not in release_notes:
+            raise AssertionError(f"docs/release-notes.md missing marker: {marker}")
+
+    datasets = (ROOT / "docs/datasets.md").read_text(encoding="utf-8")
+    for marker in ["Supported Training Layout", "SpaceJam Notes", "Annotation Format"]:
+        if marker not in datasets:
+            raise AssertionError(f"docs/datasets.md missing marker: {marker}")
 
 
 def validate_extension_points() -> None:
