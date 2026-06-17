@@ -1,0 +1,62 @@
+{
+  "task_id": "example-task-id",
+  "status": "completed",
+  "progress": 100,
+  "error": null,
+  "result": {
+    "video": "examples/lebron_shoots.mp4",
+    "created_at_unix": 1765890000.0,
+    "runtime_seconds": 12.34,
+    "frame_size": {
+      "width": 1280,
+      "height": 720
+    },
+    "seq_length": 16,
+    "vid_stride": 8,
+    "vlm_mode": "off",
+    "ollama_model": null,
+    "records": [
+      {
+        "player": 1,
+        "clip_index": 0,
+        "start_frame": 0,
+        "end_frame": 15,
+        "r2plus1d": {
+          "action_id": 4,
+          "action": "shoot",
+          "confidence": 0.82,
+          "probabilities": {
+            "shoot": 0.82,
+            "ball in hand": 0.1,
+            "dribble": 0.08
+          }
+        },
+        "motion": {
+          "avg_center_speed": 3.2,
+          "max_center_speed": 7.1,
+          "avg_box_area": 18425.0,
+          "area_change_ratio": 0.12
+        },
+        "vlm": null,
+        "final": {
+          "action_id": 4,
+          "action": "shoot",
+          "confidence": 0.82,
+          "source": "r2plus1d",
+          "needs_review": false,
+          "reason": "model confidence above high-confidence threshold"
+        }
+      }
+    ],
+    "summary": {
+      "clip_count": 1,
+      "action_counts": {
+        "shoot": 1
+      },
+      "needs_review_count": 0,
+      "source_counts": {
+        "r2plus1d": 1
+      }
+    }
+  }
+}

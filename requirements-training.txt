@@ -1,0 +1,7 @@
+-r requirements-service.txt
+pandas
+matplotlib
+scipy
+scikit-image
+vidaug
+joblib

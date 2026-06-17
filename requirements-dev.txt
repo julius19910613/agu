@@ -1,0 +1,4 @@
+-r requirements-service.txt
+pytest
+ruff
+mypy

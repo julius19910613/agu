@@ -52,3 +52,8 @@ app.include_router(analysis_router, prefix="/api/v1")
 @app.get("/health", tags=["system"])
 def health_check() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/ready", tags=["system"])
+def ready_check() -> dict[str, str]:
+    return {"status": "ready"}

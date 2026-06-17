@@ -93,3 +93,32 @@ def get_task_status(
         result=state.result
     )
 
+
+@router.post("/tasks", response_model=AnalysisRunAsyncResponse)
+def create_task_alias(
+    request: AnalysisRequest,
+    background_tasks: BackgroundTasks,
+    service: AnalysisService = Depends(get_analysis_service),
+    settings: Settings = Depends(get_settings),
+    task_manager: TaskManager = Depends(get_task_manager_dep),
+) -> AnalysisRunAsyncResponse:
+    """Backward-compatible alias for external BFF analysis task submission."""
+    return run_analysis(request, background_tasks, service, settings, task_manager)
+
+
+@router.get("/tasks/{task_id}", response_model=AnalysisTaskStatusResponse)
+def get_task_status_alias(
+    task_id: str,
+    task_manager: TaskManager = Depends(get_task_manager_dep)
+) -> AnalysisTaskStatusResponse:
+    """Backward-compatible alias for /analysis/tasks/{task_id}."""
+    return get_task_status(task_id, task_manager)
+
+
+@router.get("/tasks/{task_id}/result", response_model=AnalysisTaskStatusResponse)
+def get_task_result_alias(
+    task_id: str,
+    task_manager: TaskManager = Depends(get_task_manager_dep)
+) -> AnalysisTaskStatusResponse:
+    """Backward-compatible alias for /analysis/tasks/{task_id}/result."""
+    return get_task_status(task_id, task_manager)
