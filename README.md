@@ -247,6 +247,7 @@ curl http://127.0.0.1:8765/health
 本地与线上部署验收方案见 `docs/deploy-and-verify.md`。
 
 API 契约见 `docs/api.md`，模型说明见 `docs/model-card.md`。
+权重说明见 `docs/checkpoints.md`，扩展接口见 `docs/extensions.md`。
 
 ### 提交分析任务
 
@@ -359,10 +360,16 @@ high_confidence           可选，覆盖高置信度阈值
 ### 测试
 
 ```bash
+./venv/bin/python scripts/smoke_open_source.py
 ./venv/bin/python -m pytest tests -q
 ./venv/bin/python -m compileall app train_mac.py scripts
 ./venv/bin/python scripts/validate_open_source_baseline.py
 ```
+
+### 贡献与许可证
+
+- 贡献指南：`CONTRIBUTING.md`
+- 许可证：`LICENSE`
 
 当前已验证状态：
 

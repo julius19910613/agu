@@ -241,19 +241,19 @@ AGU 不是：
 
 ### Phase 3：开源体验补齐
 
-- 增加 `LICENSE`。
-- 增加 `CONTRIBUTING.md`。
-- 增加 `examples/sample_request.json`。
-- 增加模型权重下载说明和 checksum 约定。
-- 增加一键 smoke test。
-- 将 `requirements.txt` 拆分为 service/dev/training 三类依赖。
+- 增加 `LICENSE`。已完成：`LICENSE`。
+- 增加 `CONTRIBUTING.md`。已完成：`CONTRIBUTING.md`。
+- 增加 `examples/sample_request.json`。已完成：`examples/sample_request.json`。
+- 增加模型权重下载说明和 checksum 约定。已完成：`docs/checkpoints.md`。
+- 增加一键 smoke test。已完成：`scripts/smoke_open_source.py`。
+- 将 `requirements.txt` 拆分为 service/dev/training 三类依赖。已完成：`requirements-service.txt`、`requirements-training.txt`、`requirements-dev.txt`。
 
 ### Phase 4：能力增强
 
-- 提供 CLI：`agu analyze --video ...`。
-- 提供模型注册机制，支持替换 R(2+1)D。
-- 提供 tracker 插件接口。
-- 支持将输出写到本地、S3/COS/CloudBase Storage 等可选 backend。
+- 提供 CLI：`agu analyze --video ...`。已完成第一版：`python -m app.cli analyze --video ...`。
+- 提供模型注册机制，支持替换 R(2+1)D。已完成第一版：`app/models/registry.py`。
+- 提供 tracker 插件接口。已完成第一版：`app/analysis/tracker_registry.py`。
+- 支持将输出写到本地、S3/COS/CloudBase Storage 等可选 backend。已完成本地 backend：`app/storage/backends.py`。
 - 支持可恢复任务队列，但保持业务数据库无关。
 
 ## 当前保留/剥离清单

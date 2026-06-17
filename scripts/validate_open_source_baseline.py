@@ -49,7 +49,11 @@ def validate_examples() -> None:
 
 def validate_docs() -> None:
     required_docs = [
+        ROOT / "CONTRIBUTING.md",
+        ROOT / "LICENSE",
         ROOT / "docs/api.md",
+        ROOT / "docs/checkpoints.md",
+        ROOT / "docs/extensions.md",
         ROOT / "docs/model-card.md",
         ROOT / "docs/open-source-scope-assessment.md",
     ]
@@ -75,11 +79,28 @@ def validate_docs() -> None:
         if marker not in model_card:
             raise AssertionError(f"docs/model-card.md missing marker: {marker}")
 
+    extensions = (ROOT / "docs/extensions.md").read_text(encoding="utf-8")
+    for marker in ["Model Registry", "Tracker Registry", "Storage Backend"]:
+        if marker not in extensions:
+            raise AssertionError(f"docs/extensions.md missing marker: {marker}")
+
+
+def validate_extension_points() -> None:
+    from app.analysis.tracker_registry import list_tracker_backends
+    from app.models.registry import list_model_loaders
+
+    if "r2plus1d" not in list_model_loaders():
+        raise AssertionError("Default r2plus1d model loader is not registered")
+
+    if "YOLO" not in list_tracker_backends():
+        raise AssertionError("Default YOLO tracker backend is not registered")
+
 
 def main() -> int:
     try:
         validate_examples()
         validate_docs()
+        validate_extension_points()
     except AssertionError as exc:
         print(f"Open-source baseline validation failed: {exc}")
         return 1
