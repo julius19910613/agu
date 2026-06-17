@@ -246,6 +246,8 @@ curl http://127.0.0.1:8765/health
 
 本地与线上部署验收方案见 `docs/deploy-and-verify.md`。
 
+API 契约见 `docs/api.md`，模型说明见 `docs/model-card.md`。
+
 ### 提交分析任务
 
 ```bash
@@ -359,6 +361,7 @@ high_confidence           可选，覆盖高置信度阈值
 ```bash
 ./venv/bin/python -m pytest tests -q
 ./venv/bin/python -m compileall app train_mac.py scripts
+./venv/bin/python scripts/validate_open_source_baseline.py
 ```
 
 当前已验证状态：

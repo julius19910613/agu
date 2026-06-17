@@ -31,6 +31,7 @@ Update this file when a task uses the full workflow, changes public behavior, or
 | TASK-0003 | Document AGU deployment verification | 2026-06-17 | `docs/deploy-and-verify.md`, `README.md`, `Dockerfile`, `requirements-service.txt`, `.dockerignore` | `python scripts/verify_harness.py` | Added local, Docker self-hosted online deployment, basketball database writeback evaluation, and CloudBase integration notes for AGU-only analysis service. |
 | TASK-0004 | Assess AGU open source scope | 2026-06-17 | `docs/open-source-scope-assessment.md` | `python scripts/verify_harness.py` | Added value assessment, open-source boundaries, retained modules, and extraction roadmap. |
 | TASK-0005 | Implement open source phase 1 | 2026-06-17 | `README.md`, `app/cli.py`, `examples/`, `requirements-service.txt`, `requirements-training.txt`, `requirements-dev.txt` | `python scripts/verify_harness.py`; `python -m app.cli --help` | Added open-source positioning, sample request/output, API CLI client, dependency split, and legacy entrypoint guidance. |
+| TASK-0006 | Implement reproducible baseline phase 2 | 2026-06-17 | `docs/api.md`, `docs/model-card.md`, `scripts/validate_open_source_baseline.py`, `scripts/verify_harness.py` | `python scripts/validate_open_source_baseline.py`; `python scripts/verify_harness.py` | Added schema-validated public examples, API contract, model card, and lightweight open-source baseline gate. |
 
 ## Paused Or Blocked
 

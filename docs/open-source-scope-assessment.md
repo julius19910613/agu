@@ -410,6 +410,21 @@ player-centric basketball action understanding engine
 - 将训练/推理预处理完全统一。
 - 标准化输出 schema，稳定 `records`、`summary`、`video`、`metadata`。
 
+当前 Phase 2 已落地的低风险基线：
+
+- `docs/api.md`：稳定 API 和输出字段说明。
+- `docs/model-card.md`：记录 v3 模型、标签、预处理契约和评估指标。
+- `examples/sample_request.json`、`examples/sample_output.json`：可被 Pydantic schema 校验的公开样例。
+- `scripts/validate_open_source_baseline.py`：无 checkpoint、无视频依赖的开源基线校验。
+- `scripts/verify_harness.py`：默认调用开源基线校验。
+
+仍待后续完成：
+
+- 真正的小型 smoke video dataset。
+- 公开 checkpoint 或 dummy checkpoint 下载说明。
+- 训练/推理预处理的重训级统一。
+- benchmark 指标表。
+
 ### 3-6 个月：模型和插件化
 
 目标：让 AGU 可以承接社区贡献。

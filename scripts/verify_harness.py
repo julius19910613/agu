@@ -96,6 +96,27 @@ def python_with_pytest() -> str | None:
     return None
 
 
+def python_with_module(module: str) -> str:
+    candidates = [
+        ROOT / "venv/bin/python",
+        ROOT / ".venv/bin/python",
+        Path(sys.executable),
+    ]
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        proc = subprocess.run(
+            [str(candidate), "-c", f"import {module}"],
+            cwd=ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return str(candidate)
+    return sys.executable
+
+
 def normalize_test_command(command: str) -> list[str] | str:
     parts = shlex.split(command)
     if parts and parts[0] == "pytest":
@@ -202,6 +223,17 @@ def check_env_example(result: CheckResult) -> None:
         result.fail(f".env.example is missing Settings variables: {joined}")
 
 
+def check_open_source_baseline(result: CheckResult) -> None:
+    script = ROOT / "scripts/validate_open_source_baseline.py"
+    if not script.exists():
+        result.fail("Missing scripts/validate_open_source_baseline.py")
+        return
+
+    proc = run_command([python_with_module("pydantic"), str(script)])
+    if proc.returncode != 0:
+        result.fail(proc.stdout)
+
+
 def run_tests(result: CheckResult, command: str | None, run_all: bool) -> None:
     if not command and not run_all:
         return
@@ -228,6 +260,7 @@ def main() -> int:
     check_generated_not_staged(result)
     check_python_compiles(result)
     check_env_example(result)
+    check_open_source_baseline(result)
     run_tests(result, args.test_command, args.run_tests)
 
     if result.warnings:
