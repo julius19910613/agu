@@ -62,6 +62,24 @@ output_videos/
 analysis_outputs/
 scratch/
 examples/*.gif
+examples/*.mp4
+examples/*.mov
+examples/*.avi
+examples/*.mkv
+examples/*.png
+histories/
+service_inputs/
+*.ipynb
+
+# Open-source boundary: local/private notes, generated reviews, and legacy experiments
+CODE_REVIEW.md
+REVIEW_OUTPUT.md
+HYBRID_ACTION_ANALYSIS.md
+claude.md
+gemini.md
+C3D.py
+hybrid_service.py
+analysis/
 
 # OS-specific
 .DS_Store
@@ -80,4 +98,3 @@ dataset/
 yolov8n.pt
 analysis_output.json
 examples/adam.mp4
-
