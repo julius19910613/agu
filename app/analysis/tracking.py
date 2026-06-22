@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import tempfile
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -74,6 +75,72 @@ def read_boxes_file(path: str) -> List[Tuple[int, int, int, int]]:
     return [tuple(int(v) for v in box) for box in boxes]
 
 
+def select_active_track_ids(
+    appearance_counts: Dict[int, int],
+    frame_count: int,
+    min_appear_ratio: float = 0.02,
+    min_appear_abs: int = 5,
+    max_players: Optional[int] = None,
+) -> List[int]:
+    """Select stable player track IDs, optionally capped by strongest tracks."""
+    min_appearances = max(min_appear_abs, int(frame_count * min_appear_ratio))
+    active_track_ids = [
+        tid
+        for tid, count in appearance_counts.items()
+        if count >= min_appearances
+    ]
+    if not active_track_ids and appearance_counts:
+        active_track_ids = [max(appearance_counts, key=appearance_counts.get)]
+
+    active_track_ids.sort(key=lambda tid: (-appearance_counts.get(tid, 0), tid))
+    if max_players is not None and max_players > 0:
+        active_track_ids = active_track_ids[:max_players]
+    return sorted(active_track_ids)
+
+
+def resolve_yolo_tracker_config(
+    tracker_backend: str = "bytetrack",
+    yolo_tracker_config: str = "",
+    reid_enabled: bool = False,
+    reid_model: str = "auto",
+) -> str:
+    """Resolve the Ultralytics tracker adapter config used by AGU."""
+    backend = (tracker_backend or "bytetrack").strip().lower()
+    tracker_config = (yolo_tracker_config or "").strip()
+    if not tracker_config:
+        tracker_config = "botsort.yaml" if backend == "botsort" else "bytetrack.yaml"
+
+    if not reid_enabled:
+        return tracker_config
+
+    if backend != "botsort" and "botsort" not in tracker_config.lower():
+        return tracker_config
+
+    model_value = (reid_model or "auto").strip() or "auto"
+    temp = tempfile.NamedTemporaryFile(prefix="agu-botsort-reid-", suffix=".yaml", delete=False, mode="w")
+    temp.write(
+        "\n".join(
+            [
+                "tracker_type: botsort",
+                "track_high_thresh: 0.25",
+                "track_low_thresh: 0.1",
+                "new_track_thresh: 0.25",
+                "track_buffer: 30",
+                "match_thresh: 0.8",
+                "fuse_score: True",
+                "gmc_method: sparseOptFlow",
+                "proximity_thresh: 0.5",
+                "appearance_thresh: 0.25",
+                "with_reid: True",
+                f"model: {model_value}",
+                "",
+            ]
+        )
+    )
+    temp.close()
+    return temp.name
+
+
 def extract_tracked_frames(
     video_path: str,
     tracker_type: str = "CSRT",
@@ -85,7 +152,15 @@ def extract_tracked_frames(
     iou_thres: float = 0.6,
     min_appear_ratio: float = 0.02,
     min_appear_abs: int = 5,
-    device: Optional[str | torch.device] = None,
+    device: Optional[str] = None,
+    yolo_model_name: str = "yolov8n.pt",
+    tracker_backend: str = "bytetrack",
+    yolo_tracker_config: str = "",
+    reid_enabled: bool = False,
+    reid_model: str = "auto",
+    tracking_fps: Optional[float] = None,
+    yolo_imgsz: int = 640,
+    max_players: Optional[int] = None,
 ) -> Tuple[
     List[np.ndarray],
     List[Tuple[Tuple[float, float, float, float], ...]],
@@ -103,6 +178,10 @@ def extract_tracked_frames(
         boxes_file: Path to a JSON file with initial bounding boxes.
         max_frames: Optional cap on the number of frames to process.
         device: Torch compute device (used for YOLO).
+        tracker_backend: Open-source tracker adapter name, such as bytetrack or botsort.
+        yolo_tracker_config: Ultralytics tracker YAML name/path.
+        reid_enabled: Enables generated BoT-SORT ReID config when supported.
+        reid_model: ReID model setting for BoT-SORT.
 
     Returns:
         Tuple of (video_frames, player_boxes, width, height, colors).
@@ -112,22 +191,42 @@ def extract_tracked_frames(
         import torch
 
         if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        source_fps = 0.0
+        cap = cv2.VideoCapture(video_path)
+        try:
+            if cap.isOpened():
+                source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        finally:
+            cap.release()
+
+        frame_stride = 1
+        if tracking_fps is not None and tracking_fps > 0 and source_fps > tracking_fps:
+            frame_stride = max(1, int(round(source_fps / tracking_fps)))
 
         # Load YOLOv8 Nano model
-        yolo_model = YOLO("yolov8n.pt")
+        yolo_model = YOLO(yolo_model_name)
+        tracker_config = resolve_yolo_tracker_config(
+            tracker_backend=tracker_backend,
+            yolo_tracker_config=yolo_tracker_config,
+            reid_enabled=reid_enabled,
+            reid_model=reid_model,
+        )
 
-        # Run tracking using ByteTrack
+        # Run tracking through the configured Ultralytics tracker adapter.
         results = yolo_model.track(
             source=video_path,
-            tracker="bytetrack.yaml",
+            tracker=tracker_config,
             device=device,
             classes=[0],  # Person only
             persist=True,
             stream=True,
             verbose=False,
             conf=conf_thres,
-            iou=iou_thres
+            iou=iou_thres,
+            imgsz=yolo_imgsz,
+            vid_stride=frame_stride,
         )
 
         video_frames: List[np.ndarray] = []
@@ -159,16 +258,15 @@ def extract_tracked_frames(
 
         height, width = video_frames[0].shape[:2]
 
-        # Filter track IDs appearing in at least 5% of frames or at least 15 frames
-        min_appearances = max(min_appear_abs, int(len(video_frames) * min_appear_ratio))
-        active_track_ids = [tid for tid, count in appearance_counts.items() if count >= min_appearances]
-        active_track_ids.sort()
-
+        active_track_ids = select_active_track_ids(
+            appearance_counts=appearance_counts,
+            frame_count=len(video_frames),
+            min_appear_ratio=min_appear_ratio,
+            min_appear_abs=min_appear_abs,
+            max_players=max_players,
+        )
         if not active_track_ids:
-            if appearance_counts:
-                active_track_ids = [max(appearance_counts, key=appearance_counts.get)]
-            else:
-                active_track_ids = [0]
+            active_track_ids = [0]
 
         # Build final player_boxes
         player_boxes: List[Tuple[Tuple[float, float, float, float], ...]] = []

@@ -95,7 +95,11 @@ def predict_player_clips(
     Returns:
         Dictionary mapping player index to list of ModelPrediction objects.
     """
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else ("mps" if torch.backends.mps.is_available() else "cpu")
+    )
     all_predictions: Dict[int, List[ModelPrediction]] = {}
 
     for player, clips in player_clips.items():
@@ -103,7 +107,7 @@ def predict_player_clips(
         for start in range(0, len(clips), batch_size):
             batch_np = np.asarray(clips[start : start + batch_size])
             batch = inference_batch(batch_np).to(device)
-            with torch.no_grad():
+            with torch.inference_mode():
                 outputs = model(batch)
                 softmax = torch.softmax(outputs, dim=1).detach().cpu().numpy()
 

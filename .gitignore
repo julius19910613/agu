@@ -98,3 +98,56 @@ dataset/
 yolov8n.pt
 analysis_output.json
 examples/adam.mp4
+
+# Local environment variants and secrets
+.env.*
+!.env.example
+*.env
+*.secret
+*.secrets
+*.credentials
+*.credential
+*.token
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+credentials/
+private/
+
+# Local agent / IDE / personal workflow state
+.idea/
+.cursor/
+.windsurf/
+.claude/
+.codex/
+.mcp.json
+settings.local.json
+*.local.json
+*.local.yaml
+*.local.yml
+*.local.toml
+
+# Local logs, scratch reports, and profiling artifacts
+logs/
+*.log
+*.pid
+*.prof
+*.profile
+*.trace
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# Local media screenshots and generated review artifacts
+player_stat_screenshots*/
+identity-duplicate-review*/
+analysis_outputs/**/player_stat_screenshots*/
+analysis_outputs/**/identity-duplicate-review*/
+analysis_outputs/**/*.jpg
+analysis_outputs/**/*.jpeg
+analysis_outputs/**/*.png
+analysis_outputs/**/*.webp

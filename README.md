@@ -1,7 +1,7 @@
 # AGU
 
 - [中文版本](#中文版本)
-- [English Version](#english-version)
+- [English Summary](#english-summary)
 
 ## 中文版本
 
@@ -27,12 +27,14 @@ basketball video -> player tracks -> action clips -> structured JSON + optional 
 
 ### 分析流程
 
-1. 读取视频并跟踪球员，默认使用 `YOLO` + ByteTrack，也支持 OpenCV legacy trackers。
-2. 按 `seq_length` 和 `vid_stride` 将球员轨迹切成重叠窗口。
-3. 对每个球员窗口运行 R(2+1)D 动作分类。
-4. 对低置信度片段可选调用本地 Ollama VLM 复核。
-5. 融合模型、VLM 和时序证据，并做 temporal smoothing。
-6. 输出 JSON 结果，可选生成标注视频。
+1. 默认把视频切成带 overlap 的 segment，避免动作在切片边界被截断。
+2. 在每个 segment 内读取视频并跟踪球员，默认使用 `YOLO` + ByteTrack，也支持 OpenCV legacy trackers。
+3. YOLO 默认走 CPU、低帧率和较低 `imgsz` 跟踪；这些加速参数均从 `BASKETBALL_` 配置或请求体读取。
+4. 按 `seq_length` 和 `vid_stride` 将球员轨迹切成重叠窗口；分段分析默认可使用更大的 `action_vid_stride` 减少重复推理。
+5. 对每个球员窗口运行 R(2+1)D 动作分类，默认优先使用 MPS（可用时）并回退 CPU/CUDA。
+6. 对低置信度片段可选调用本地 Ollama VLM 复核，也可对 segment contact sheet 做 VLM audit。
+7. 融合模型、VLM 和时序证据，并做 temporal smoothing。
+8. 输出 JSON 结果，可选生成标注视频。
 
 ### 动作标签
 
@@ -56,11 +58,35 @@ basketball video -> player tracks -> action clips -> structured JSON + optional 
   - `GET /api/v1/analysis/status/{task_id}` 查询任务状态和结果。
 - 多种跟踪方式：
   - 默认 `YOLO`，使用 `bytetrack.yaml`。
+  - 可配置开源 tracker adapter：`BASKETBALL_TRACKER_BACKEND=bytetrack|botsort|custom`。
+  - BoT-SORT/ReID 可通过 `BASKETBALL_YOLO_REID_ENABLED`、`BASKETBALL_YOLO_REID_MODEL` 和自定义 tracker YAML 接入。
   - OpenCV legacy trackers：`CSRT`、`MOSSE`、`KCF` 等。
+- 球员身份 embedding：
+  - 默认使用 `torchvision_mobilenet_v3_small` 生成 576 维 appearance embedding。
+  - `sidecar_hsv_hist` 仅作为轻量 fallback/测试后端保留。
 - 模型推理：
   - 从 checkpoint 加载 `R(2+1)D-18`。
 - 可选 VLM 复核：
   - `off` / `low-confidence` / `always`。
+- 默认长视频分段：
+  - `segmented_analysis=true`，通过 `segment_duration_sec` 和 `segment_overlap_sec` 控制 segment。
+  - `result.long_video.segments[]` 提供分段统计与 VLM audit 状态。
+  - `result.player_identity_features[]` 提供局部轨迹模型 appearance embedding 和 continuity 特征。
+  - `result.long_video.players[]` 提供 segment-local 球员动作汇总和 `appearance_continuity_stitch_v2` 的轻量 `global_player_id` 身份候选。
+  - `result.long_video.identity_duplicate_candidates[]` 提供疑似重复 `global_player_id` 的合并审核候选，不自动改写统计。
+  - `result.long_video.event_candidates[]` 提供 `block_candidate`、`rebound_candidate`、`steal_candidate` 事件线索。
+- 推理加速：
+  - `BASKETBALL_TRACKING_FPS=8.0` 对 YOLO 跟踪做低帧率采样。
+  - `BASKETBALL_YOLO_IMGSZ=320` 降低 YOLO 输入尺寸。
+  - `BASKETBALL_YOLO_DEVICE=cpu` 避免当前 Mac MPS 跑 YOLO 变慢。
+  - `BASKETBALL_R2PLUS1D_DEVICE=mps_if_available` 让 R(2+1)D 在支持时走 MPS。
+  - `BASKETBALL_ACTION_VID_STRIDE=24` 用于默认分段分析，减少重复动作窗口。
+  - `BASKETBALL_MAX_PLAYERS_PER_SEGMENT=12` 保留出现最稳定的球员轨迹，避免噪声 track 放大推理量。
+- 球员技术统计估算：
+  - `statistics.points`、`assists`、`rebounds`、`blocks`、`steals`。
+  - 当前为 `action_proxy_v1`，不是正式技术统计；points 来自 `shoot`，assists 来自 `pass`。
+  - `block` 不再直接计入正式 `statistics.blocks`；会先输出 `block_candidate`，等待球/篮筐/投篮或 VLM 确认。
+  - `rebound_candidate` 和 `steal_candidate` 由简化球权状态线索生成，仍需球检测、篮筐检测或 VLM/人工确认。
 - 输出文件：
   - JSON：`analysis_outputs/*.json`
   - 视频：`output_videos/*.mp4`
@@ -111,7 +137,13 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8765
 ```bash
 curl -sS -X POST http://127.0.0.1:8765/api/v1/analysis/run \
   -H "Content-Type: application/json" \
-  -d @examples/sample_request.json
+  -d '{
+    "video_path": "examples/lebron_shoots.mp4",
+    "vlm_mode": "off",
+    "generate_video": false,
+    "segmented_analysis": false,
+    "max_frames": 60
+  }'
 ```
 
 使用 CLI：
@@ -183,16 +215,10 @@ python -m venv .venv
 source .venv/bin/activate
 ```
 
-也可以直接使用仓库已有环境：
-
-```bash
-source ./venv/bin/activate
-```
-
 安装依赖：
 
 ```bash
-./venv/bin/pip install -r requirements-service.txt
+pip install -r requirements-service.txt
 ```
 
 依赖文件分工：
@@ -216,8 +242,25 @@ BASKETBALL_LR=0.0001
 BASKETBALL_NUM_CLASSES=10
 BASKETBALL_SEQ_LENGTH=16
 BASKETBALL_VID_STRIDE=8
+BASKETBALL_ACTION_VID_STRIDE=24
 BASKETBALL_BATCH_SIZE=8
+BASKETBALL_R2PLUS1D_DEVICE=mps_if_available
+BASKETBALL_YOLO_DEVICE=cpu
+BASKETBALL_TRACKING_FPS=8.0
+BASKETBALL_YOLO_IMGSZ=320
+BASKETBALL_MAX_PLAYERS_PER_SEGMENT=12
+BASKETBALL_TORCH_NUM_THREADS=10
+BASKETBALL_PROGRESS_LOG=true
 BASKETBALL_TRACKER_TYPE=YOLO
+BASKETBALL_TRACKER_BACKEND=bytetrack
+BASKETBALL_YOLO_TRACKER_CONFIG=
+BASKETBALL_YOLO_REID_ENABLED=false
+BASKETBALL_YOLO_REID_MODEL=auto
+BASKETBALL_IDENTITY_EMBEDDING_BACKEND=torchvision_mobilenet_v3_small
+BASKETBALL_IDENTITY_EMBEDDING_WEIGHTS=default
+BASKETBALL_IDENTITY_EMBEDDING_DEVICE=mps_if_available
+BASKETBALL_IDENTITY_EMBEDDING_BATCH_SIZE=16
+BASKETBALL_IDENTITY_EMBEDDING_ALLOW_FALLBACK=true
 BASKETBALL_VLM_MODE=low-confidence
 BASKETBALL_OLLAMA_MODEL=qwen3-vl:4b
 BASKETBALL_OLLAMA_HOST=http://127.0.0.1:11434
@@ -263,7 +306,11 @@ curl -X POST http://127.0.0.1:8765/api/v1/analysis/run \
     "tracker_conf_thres": 0.3,
     "tracker_iou_thres": 0.6,
     "tracker_min_appear_ratio": 0.02,
-    "tracker_min_appear_abs": 5
+    "tracker_min_appear_abs": 5,
+    "segmented_analysis": true,
+    "segment_duration_sec": 15.0,
+    "segment_overlap_sec": 2.0,
+    "vlm_audit": true
   }'
 ```
 
@@ -291,6 +338,15 @@ tracker_conf_thres        默认 0.3
 tracker_iou_thres         默认 0.6
 tracker_min_appear_ratio  默认 0.02
 tracker_min_appear_abs    默认 5
+segmented_analysis        默认 true，统一走带 overlap 的分段分析
+long_video_mode           兼容字段，true 时也启用分段分析
+segment_duration_sec      默认 15.0
+segment_overlap_sec       默认 2.0
+segment_start_sec         默认 0.0，可用于局部 smoke
+segment_end_sec           可选，局部分析结束时间
+max_segments              可选，限制分段数量
+vlm_audit                 默认 true，对 segment contact sheet 做 VLM audit
+vlm_audit_frames          默认 6
 vid_stride                可选，覆盖默认窗口步长
 low_confidence            可选，覆盖低置信度阈值
 high_confidence           可选，覆盖高置信度阈值
@@ -374,11 +430,7 @@ high_confidence           可选，覆盖高置信度阈值
 - 公开发布说明：`docs/release-notes.md`
 - 数据集获取说明：`docs/datasets.md`
 
-当前已验证状态：
-
-```text
-38 passed
-```
+当前验证状态以 `docs/harness/TASK-BOARD.md` 的最新任务记录为准。
 
 ### 安全与运行时约束
 
@@ -389,307 +441,45 @@ high_confidence           可选，覆盖高置信度阈值
 
 ### 开源状态与待补充项
 
-- 当前仓库未包含 `LICENSE` 文件。
+- 仓库包含 `LICENSE`，公开发布前仍需复核第三方依赖、数据集和模型权重的许可证边界。
 - 数据集与权重不随仓库分发，需要自行准备 SpaceJam 标注和视频。
 - `requirements.txt` 不是严格 lockfile。
 - 若准备公开发布，需要补充来源声明、许可证、数据集获取说明和权重分发策略。
 
-## English Version
+## English Summary
 
-### Overview
+AGU is an open-source basketball video understanding engine. It focuses on video analysis only: player tracking, action classification, segmented long-video analysis, optional local VLM review, identity evidence, duplicate-identity review candidates, event candidates, and optional annotated outputs. It is not the BFF, authentication layer, rate limiter, product backend, or operations console.
 
-AGU is a basketball action and game understanding project that combines player tracking, clip-level action classification, lightweight motion features, and optional local VLM review.
+Current API entry points:
 
-This repository provides:
+- `POST /api/v1/analysis/run` starts an async analysis task.
+- `GET /api/v1/analysis/status/{task_id}` returns task progress and result.
+- `/api/v1/analysis/tasks*` aliases are kept for external gateway compatibility.
 
-- A FastAPI service for asynchronous video analysis.
-- A Mac/CPU/MPS-friendly training entrypoint, `train_mac.py`.
-- Legacy compatibility scripts: `train.py`, `hybrid_analysis.py`, and `hybrid_service.py`.
+Current identity and statistics behavior:
 
-The current deployment target is `model_checkpoints/r2plus1d_v3/best.pt`. Inference preprocessing is fixed to the v3 training distribution: OpenCV BGR, resize to `112x112`, values remain in `[0,255]`, with no RGB conversion, no `/255`, and no Kinetics normalization.
+- Long videos are analyzed through overlapped segments by default.
+- `player_identity_features[]` exposes model/fallback appearance embeddings and continuity evidence.
+- `long_video.players[]` exposes lightweight `global_player_id` candidates.
+- `long_video.identity_duplicate_candidates[]` exposes review-only duplicate-ID merge candidates and does not rewrite statistics automatically.
+- `statistics.points`, `assists`, `rebounds`, `blocks`, and `steals` are action-proxy estimates, not official box-score truth. Block, rebound, and steal evidence should be confirmed through event candidates, ball/rim/possession evidence, VLM, or human review.
 
-### Analysis Pipeline
-
-1. Load the video and track players. The default tracker is `YOLO` + ByteTrack, with OpenCV legacy trackers available as fallbacks.
-2. Split player trajectories into overlapping windows using `seq_length` and `vid_stride`.
-3. Run R(2+1)D action classification for each player window.
-4. Optionally call a local Ollama VLM for low-confidence clips.
-5. Fuse model, VLM, and temporal evidence, then apply temporal smoothing.
-6. Emit JSON output and optionally write an annotated video.
-
-### Action Labels
-
-```text
-0 block
-1 pass
-2 run
-3 dribble
-4 shoot
-5 ball in hand
-6 defense
-7 pick
-8 no_action
-9 walk
-```
-
-### Features
-
-- Async analysis API:
-  - `POST /api/v1/analysis/run` starts an analysis task.
-  - `GET /api/v1/analysis/status/{task_id}` polls task status and results.
-- Multiple trackers:
-  - Default `YOLO`, using `bytetrack.yaml`.
-  - OpenCV legacy trackers such as `CSRT`, `MOSSE`, and `KCF`.
-- Model inference:
-  - Loads `R(2+1)D-18` from a checkpoint.
-- Optional VLM review:
-  - `off` / `low-confidence` / `always`.
-- Output files:
-  - JSON: `analysis_outputs/*.json`
-  - Video: `output_videos/*.mp4`
-- Static routes:
-  - `/static/outputs`
-  - `/static/videos`
-
-### Tech Stack
-
-- Python / FastAPI / Pydantic-Settings
-- PyTorch / TorchVision
-- OpenCV / YOLOv8
-- NumPy / scikit-learn
-- urllib for the Ollama HTTP client
-- pytest
-
-### Repository Layout
-
-```text
-.
-├── app/
-│   ├── main.py               FastAPI app and lifespan
-│   ├── config.py             Settings loaded from .env
-│   ├── dependencies.py       Global model/service dependencies
-│   ├── analysis/
-│   │   ├── router.py         /api/v1/analysis routes
-│   │   ├── schemas.py        Request/response schemas
-│   │   ├── service.py        Analysis orchestration
-│   │   ├── tracking.py       Tracking and window cropping
-│   │   ├── inference.py      R(2+1)D inference and v3 preprocessing
-│   │   ├── motion.py         Motion features
-│   │   ├── vlm.py            Ollama VLM verifier
-│   │   ├── fusion.py         Model + VLM fusion and smoothing
-│   │   └── task_manager.py   In-memory task state
-│   ├── video/
-│   │   └── writer.py         Annotated video output
-│   └── models/
-│       ├── r2plus1d.py       best.pt loader
-│       └── preprocessing.py  v3-aligned preprocessing
-├── dataset.py                SpaceJam dataset wrapper
-├── train_mac.py              Recommended training script
-├── train.py                  Historical training script
-├── hybrid_analysis.py        Legacy all-in-one script
-├── hybrid_service.py         Legacy lightweight HTTP service
-├── scripts/                  Helper scripts
-├── requirements.txt
-├── pytest.ini
-├── .env.example
-└── README.md
-```
-
-Runtime data directories are ignored by default:
-
-```text
-dataset/
-model_checkpoints/
-analysis_outputs/
-output_videos/
-```
-
-### Environment And Setup
-
-Recommended virtual environment:
+Setup:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-```
-
-You can also use the existing repository environment:
-
-```bash
-source ./venv/bin/activate
-```
-
-Install dependencies:
-
-```bash
-./venv/bin/pip install -r requirements.txt
-
-# If you do not want to use the historical requirements snapshot:
-./venv/bin/pip install fastapi uvicorn torch torchvision opencv-contrib-python ultralytics scikit-learn pydantic-settings tqdm easydict numpy
-```
-
-`requirements.txt` is a historical snapshot, not a strict reproducible lockfile. Service dependencies such as FastAPI, YOLO, and Pydantic-Settings should be pinned per target platform before production use.
-
-### Configuration
-
-Settings are read from environment variables or `.env` using the `BASKETBALL_` prefix. Example:
-
-```text
-BASKETBALL_MODEL_PATH=model_checkpoints/r2plus1d_v3/
-BASKETBALL_BASE_MODEL_NAME=best
-BASKETBALL_START_EPOCH=0
-BASKETBALL_LR=0.0001
-BASKETBALL_NUM_CLASSES=10
-BASKETBALL_SEQ_LENGTH=16
-BASKETBALL_VID_STRIDE=8
-BASKETBALL_BATCH_SIZE=8
-BASKETBALL_TRACKER_TYPE=YOLO
-BASKETBALL_VLM_MODE=low-confidence
-BASKETBALL_OLLAMA_MODEL=qwen3-vl:4b
-BASKETBALL_OLLAMA_HOST=http://127.0.0.1:11434
-BASKETBALL_OLLAMA_TIMEOUT=45.0
-BASKETBALL_LOW_CONFIDENCE=0.45
-BASKETBALL_HIGH_CONFIDENCE=0.70
-BASKETBALL_SMOOTHING_CONFIDENCE=0.60
-BASKETBALL_OUTPUT_DIR=analysis_outputs
-BASKETBALL_VIDEO_OUTPUT_DIR=output_videos
-BASKETBALL_HOST=127.0.0.1
-BASKETBALL_PORT=8765
-```
-
-### Start The API
-
-```bash
+pip install -r requirements-service.txt
 cp .env.example .env
-./venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8765
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8765
 ```
 
-Health check:
+Useful docs:
 
-```bash
-curl http://127.0.0.1:8765/health
-```
+- API contract: `docs/api.md`
+- Model card: `docs/model-card.md`
+- Checkpoints: `docs/checkpoints.md`
+- Extensions: `docs/extensions.md`
+- Open-source release notes: `docs/release-notes.md`
+- Harness workflow and task board: `docs/harness/WORKFLOW.md`, `docs/harness/TASK-BOARD.md`
 
-### Submit An Analysis Task
-
-```bash
-curl -X POST http://127.0.0.1:8765/api/v1/analysis/run \
-  -H "Content-Type: application/json" \
-  -d '{
-    "video_path": "examples/lebron_shoots.mp4",
-    "vlm_mode": "low-confidence",
-    "max_frames": 180,
-    "generate_video": true,
-    "tracker_conf_thres": 0.3,
-    "tracker_iou_thres": 0.6,
-    "tracker_min_appear_ratio": 0.02,
-    "tracker_min_appear_abs": 5
-  }'
-```
-
-Example response:
-
-```text
-{"task_id":"...","status":"pending","message":"Analysis started asynchronously..."}
-```
-
-Poll task status:
-
-```bash
-curl http://127.0.0.1:8765/api/v1/analysis/status/<task_id>
-```
-
-### Request Parameters
-
-```text
-video_path                Required video path
-vlm_mode                  low-confidence | off | always
-boxes_file                Optional initial boxes JSON
-max_frames                Optional frame limit
-generate_video            Whether to generate an annotated video
-tracker_conf_thres        Default 0.3
-tracker_iou_thres         Default 0.6
-tracker_min_appear_ratio  Default 0.02
-tracker_min_appear_abs    Default 5
-vid_stride                Optional window stride override
-low_confidence            Optional low-confidence threshold override
-high_confidence           Optional high-confidence threshold override
-```
-
-### Training
-
-Recommended training command:
-
-```bash
-./venv/bin/python train_mac.py \
-  --device mps \
-  --batch-size 2 \
-  --epochs 20 \
-  --lr 1e-4 \
-  --annotation-path dataset/annotation_dict.json \
-  --augmented-path dataset/augmented_annotation_dict.json \
-  --video-dir dataset/examples/ \
-  --augmented-dir dataset/augmented-examples/ \
-  --model-dir model_checkpoints/r2plus1d_v3/ \
-  --history-path histories/history_r2plus1d_v3.txt
-```
-
-Resume training:
-
-```bash
-./venv/bin/python train_mac.py \
-  --resume model_checkpoints/r2plus1d_v3/best.pt \
-  --epochs 30
-```
-
-Common training flags:
-
-```text
---accum-steps
---best-metric
---early-stop-patience
---weight-decay
---label-smoothing
---fc-dropout
---no-freeze-bn
---no-class-weights
---no-sampler
---use-augmentation
---force-resplit
-```
-
-### Helper Scripts
-
-```bash
-./venv/bin/python scripts/check_training.py --history-path histories/history_r2plus1d_v3.txt
-./venv/bin/python scripts/gen_augmented.py --minority-only --multiplier 3
-./venv/bin/python scripts/gen_splits.py --annotation-path dataset/annotation_dict.json
-./venv/bin/python scripts/manual_test_run.py
-```
-
-### Testing
-
-```bash
-./venv/bin/python -m pytest tests -q
-./venv/bin/python -m compileall app train_mac.py scripts
-```
-
-Current verified status:
-
-```text
-38 passed
-```
-
-### Safety And Runtime Notes
-
-- `POST /api/v1/analysis/run` validates `video_path` to prevent simple path traversal.
-- Task state and results are stored in the in-memory `TaskManager`; they are lost after process restart.
-- Datasets, model weights, and output directories are ignored by default.
-- `app/models/preprocessing.py` follows the deployed v3 preprocessing contract: BGR, `112x112`, `[0,255]`, no `/255`, and no Kinetics normalization.
-
-### Open Source Readiness
-
-- This repository currently has no `LICENSE` file.
-- Datasets and model weights are not distributed with the repository. SpaceJam annotations and videos must be prepared separately.
-- `requirements.txt` is not a strict lockfile.
-- Before public release, add provenance notes, licensing, dataset acquisition instructions, and a model-weight distribution policy.

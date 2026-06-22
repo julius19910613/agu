@@ -1,10 +1,24 @@
 import unittest
+from collections import Counter
+from unittest.mock import MagicMock
 import numpy as np
 
-from app.analysis.schemas import ModelPrediction, VLMDecisionResponse, FinalDecisionResponse
+import torch
+
+from app.analysis.schemas import (
+    AnalysisRecordResponse,
+    AnalysisRequest,
+    FinalDecisionResponse,
+    LongVideoPlayerSummaryResponse,
+    ModelPrediction,
+    MotionFeatures,
+    PlayerIdentityFeatureResponse,
+    VLMDecisionResponse,
+)
+from app.analysis.service import AnalysisService
 from app.analysis.vlm import extract_json_object, normalize_action
 from app.analysis.fusion import fuse_decision, should_call_vlm, apply_temporal_smoothing
-from app.analysis.tracking import crop_windows
+from app.analysis.tracking import crop_windows, resolve_yolo_tracker_config, select_active_track_ids
 
 
 class HybridAnalysisTest(unittest.TestCase):
@@ -26,6 +40,56 @@ class HybridAnalysisTest(unittest.TestCase):
             action=action,
             confidence=confidence,
             probabilities={action: confidence},
+        )
+
+    def make_service(self):
+        settings = MagicMock()
+        settings.seq_length = 16
+        settings.vid_stride = 8
+        settings.action_vid_stride = 24
+        settings.smoothing_confidence = 0.6
+        settings.torch_num_threads = 0
+        settings.progress_log = False
+        settings.identity_embedding_backend = "sidecar_hsv_hist"
+        settings.identity_embedding_weights = "default"
+        settings.identity_embedding_device = "cpu"
+        settings.identity_embedding_batch_size = 2
+        settings.identity_embedding_allow_fallback = True
+        return AnalysisService(settings=settings, model=MagicMock(), device=torch.device("cpu"))
+
+    def make_record(self, player, action, start_frame, end_frame, segment_id=0, confidence=0.7):
+        action_ids = {
+            "block": 0,
+            "pass": 1,
+            "run": 2,
+            "dribble": 3,
+            "shoot": 4,
+            "ball in hand": 5,
+            "defense": 6,
+            "pick": 7,
+            "no_action": 8,
+            "walk": 9,
+        }
+        return AnalysisRecordResponse(
+            player=player,
+            clip_index=start_frame,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            segment_id=segment_id,
+            local_player_id=f"segment_{segment_id}:player_{player}",
+            global_player_id=f"player_{player:03d}",
+            identity_confidence=0.6,
+            r2plus1d=self.make_prediction(action, confidence),
+            motion=MotionFeatures(avg_center_speed=1.0, max_center_speed=2.0, avg_box_area=100.0, area_change_ratio=1.0),
+            vlm=None,
+            final=FinalDecisionResponse(
+                action_id=action_ids[action],
+                action=action,
+                confidence=confidence,
+                source="r2plus1d",
+                needs_review=False,
+                reason="test",
+            ),
         )
 
     def test_extract_json_object_accepts_wrapped_json(self):
@@ -75,6 +139,323 @@ class HybridAnalysisTest(unittest.TestCase):
         windows = crop_windows(frames, boxes, seq_length=4, vid_stride=3)
         self.assertEqual(len(windows[0]), 3)
         self.assertEqual(windows[0][0].shape, (4, 176, 128, 3))
+
+    def test_acceleration_request_fields_are_supported(self):
+        request = AnalysisRequest(
+            video_path="examples/lebron_shoots.mp4",
+            action_vid_stride=24,
+            tracking_fps=8.0,
+            yolo_imgsz=320,
+            max_players_per_segment=12,
+            yolo_device="cpu",
+            tracker_backend="botsort",
+            yolo_tracker_config="botsort.yaml",
+            yolo_reid_enabled=True,
+            yolo_reid_model="auto",
+            identity_embedding_backend="torchvision_mobilenet_v3_small",
+            identity_embedding_weights="none",
+            identity_embedding_device="cpu",
+            r2plus1d_device="mps_if_available",
+        )
+        self.assertEqual(request.action_vid_stride, 24)
+        self.assertEqual(request.tracking_fps, 8.0)
+        self.assertEqual(request.yolo_imgsz, 320)
+        self.assertEqual(request.max_players_per_segment, 12)
+        self.assertEqual(request.yolo_device, "cpu")
+        self.assertEqual(request.tracker_backend, "botsort")
+        self.assertEqual(request.yolo_tracker_config, "botsort.yaml")
+        self.assertTrue(request.yolo_reid_enabled)
+        self.assertEqual(request.yolo_reid_model, "auto")
+        self.assertEqual(request.identity_embedding_backend, "torchvision_mobilenet_v3_small")
+        self.assertEqual(request.identity_embedding_weights, "none")
+        self.assertEqual(request.identity_embedding_device, "cpu")
+        self.assertEqual(request.r2plus1d_device, "mps_if_available")
+
+    def test_yolo_tracker_adapter_config_resolution(self):
+        self.assertEqual(resolve_yolo_tracker_config(), "bytetrack.yaml")
+        self.assertEqual(resolve_yolo_tracker_config(tracker_backend="botsort"), "botsort.yaml")
+        self.assertEqual(
+            resolve_yolo_tracker_config(tracker_backend="custom", yolo_tracker_config="/tmp/custom.yaml"),
+            "/tmp/custom.yaml",
+        )
+
+    def test_botsort_reid_adapter_generates_tracker_config(self):
+        path = resolve_yolo_tracker_config(
+            tracker_backend="botsort",
+            reid_enabled=True,
+            reid_model="auto",
+        )
+        self.assertTrue(path.endswith(".yaml"))
+        with open(path, "r") as fp:
+            text = fp.read()
+        self.assertIn("tracker_type: botsort", text)
+        self.assertIn("with_reid: True", text)
+        self.assertIn("model: auto", text)
+
+    def test_select_active_track_ids_caps_to_strongest_tracks(self):
+        selected = select_active_track_ids(
+            appearance_counts={3: 10, 1: 30, 2: 20},
+            frame_count=40,
+            min_appear_ratio=0.1,
+            min_appear_abs=1,
+            max_players=2,
+        )
+        self.assertEqual(selected, [1, 2])
+
+    def test_block_actions_are_not_counted_as_official_blocks(self):
+        service = self.make_service()
+        stats = service._estimate_player_statistics(Counter({"block": 5, "shoot": 1}))
+        self.assertEqual(stats.points, 2)
+        self.assertEqual(stats.blocks, 0)
+        self.assertTrue(any("block_candidate" in note for note in stats.notes))
+
+    def test_adjacent_segment_identity_stitch_assigns_global_ids(self):
+        service = self.make_service()
+        summaries = [
+            LongVideoPlayerSummaryResponse(
+                player_id="segment_0:player_2",
+                segments_seen=1,
+                clip_count=3,
+                action_counts={"dribble": 2, "pass": 1},
+                needs_review_count=0,
+                average_confidence=0.7,
+            ),
+            LongVideoPlayerSummaryResponse(
+                player_id="segment_1:player_2",
+                segments_seen=1,
+                clip_count=3,
+                action_counts={"dribble": 2, "pass": 1},
+                needs_review_count=0,
+                average_confidence=0.7,
+            ),
+        ]
+        identity_map, identity_confidences, identity_evidence = service._merge_segment_local_identities(summaries)
+        self.assertEqual(identity_map["segment_0:player_2"], identity_map["segment_1:player_2"])
+        self.assertGreater(identity_confidences["segment_1:player_2"], 0.4)
+        self.assertTrue(identity_evidence["segment_1:player_2"])
+
+    def test_identity_stitch_uses_appearance_and_track_continuity(self):
+        service = self.make_service()
+        summaries = [
+            LongVideoPlayerSummaryResponse(
+                player_id="segment_0:player_2",
+                segments_seen=1,
+                clip_count=3,
+                action_counts={"dribble": 2, "pass": 1},
+                needs_review_count=0,
+                average_confidence=0.7,
+            ),
+            LongVideoPlayerSummaryResponse(
+                player_id="segment_1:player_7",
+                segments_seen=1,
+                clip_count=3,
+                action_counts={"dribble": 2, "pass": 1},
+                needs_review_count=0,
+                average_confidence=0.7,
+            ),
+        ]
+        features = {
+            "segment_0:player_2": PlayerIdentityFeatureResponse(
+                player=2,
+                segment_id=0,
+                local_player_id="segment_0:player_2",
+                start_frame=0,
+                end_frame=100,
+                first_center=[100.0, 200.0],
+                last_center=[150.0, 220.0],
+                appearance_signature={"h_mean": 0.2, "s_mean": 0.5, "v_mean": 0.7, "b_mean": 0.1, "g_mean": 0.2, "r_mean": 0.3},
+                appearance_embedding=[0.8, 0.2, 0.1, 0.0],
+                embedding_model="test_embedding",
+                embedding_dim=4,
+                track_coverage=1.0,
+            ),
+            "segment_1:player_7": PlayerIdentityFeatureResponse(
+                player=7,
+                segment_id=1,
+                local_player_id="segment_1:player_7",
+                start_frame=101,
+                end_frame=200,
+                first_center=[160.0, 225.0],
+                last_center=[220.0, 250.0],
+                appearance_signature={"h_mean": 0.21, "s_mean": 0.49, "v_mean": 0.69, "b_mean": 0.1, "g_mean": 0.21, "r_mean": 0.31},
+                appearance_embedding=[0.79, 0.21, 0.1, 0.0],
+                embedding_model="test_embedding",
+                embedding_dim=4,
+                track_coverage=1.0,
+            ),
+        }
+        identity_map, identity_confidences, identity_evidence = service._merge_segment_local_identities(summaries, features)
+        self.assertEqual(identity_map["segment_0:player_2"], identity_map["segment_1:player_7"])
+        self.assertGreater(identity_confidences["segment_1:player_7"], 0.6)
+        evidence = " ".join(identity_evidence["segment_1:player_7"])
+        self.assertIn("embedding similarity", evidence)
+        self.assertIn("track continuity", evidence)
+
+    def test_identity_feature_extraction_generates_sidecar_embedding(self):
+        service = self.make_service()
+        frames = [np.full((32, 32, 3), fill_value=80 + index, dtype=np.uint8) for index in range(4)]
+        boxes = [[(4.0, 4.0, 16.0, 20.0)]] * 4
+        features = service._extract_player_identity_features(frames, boxes)
+        self.assertEqual(len(features), 1)
+        self.assertEqual(features[0].embedding_model, "sidecar_hsv_hist_embedding_v1")
+        self.assertEqual(features[0].embedding_dim, 128)
+        self.assertEqual(len(features[0].appearance_embedding), 128)
+
+    def test_identity_feature_extraction_can_use_torchvision_backend(self):
+        service = self.make_service()
+        service.settings.identity_embedding_backend = "torchvision_mobilenet_v3_small"
+        service.settings.identity_embedding_weights = "none"
+        service.settings.identity_embedding_device = "cpu"
+        frames = [np.full((48, 48, 3), fill_value=80 + index, dtype=np.uint8) for index in range(2)]
+        boxes = [[(4.0, 4.0, 24.0, 28.0)]] * 2
+        features = service._extract_player_identity_features(frames, boxes)
+        self.assertEqual(len(features), 1)
+        self.assertEqual(features[0].embedding_model, "torchvision_mobilenet_v3_small_none_embedding_v1")
+        self.assertEqual(features[0].embedding_dim, 576)
+        self.assertEqual(len(features[0].appearance_embedding), 576)
+
+    def test_identity_stitch_does_not_merge_players_within_same_segment(self):
+        service = self.make_service()
+        summaries = [
+            LongVideoPlayerSummaryResponse(
+                player_id="segment_0:player_1",
+                segments_seen=1,
+                clip_count=3,
+                action_counts={"dribble": 3},
+                needs_review_count=0,
+                average_confidence=0.7,
+            ),
+            LongVideoPlayerSummaryResponse(
+                player_id="segment_0:player_2",
+                segments_seen=1,
+                clip_count=3,
+                action_counts={"dribble": 3},
+                needs_review_count=0,
+                average_confidence=0.7,
+            ),
+        ]
+        identity_map, _, _ = service._merge_segment_local_identities(summaries)
+        self.assertNotEqual(identity_map["segment_0:player_1"], identity_map["segment_0:player_2"])
+
+    def test_event_candidate_detection_emits_block_rebound_and_steal_candidates(self):
+        service = self.make_service()
+        records = [
+            self.make_record(0, "shoot", 0, 15),
+            self.make_record(1, "ball in hand", 40, 55),
+            self.make_record(2, "defense", 56, 70),
+            self.make_record(2, "dribble", 72, 87),
+            self.make_record(2, "block", 100, 115),
+            self.make_record(2, "block", 124, 139),
+        ]
+        candidates = service._detect_event_candidates(records)
+        event_types = {candidate.event_type for candidate in candidates}
+        self.assertIn("block_candidate", event_types)
+        self.assertIn("rebound_candidate", event_types)
+        self.assertIn("steal_candidate", event_types)
+
+    def test_identity_duplicate_candidates_suggest_review_merge(self):
+        service = self.make_service()
+        summaries = [
+            LongVideoPlayerSummaryResponse(
+                player_id="segment_0:player_4",
+                global_player_id="player_004",
+                identity_confidence=0.25,
+                segments_seen=1,
+                clip_count=3,
+                action_counts={"dribble": 2, "pass": 1},
+                needs_review_count=0,
+                average_confidence=0.7,
+            ),
+            LongVideoPlayerSummaryResponse(
+                player_id="segment_2:player_6",
+                global_player_id="player_006",
+                identity_confidence=0.25,
+                segments_seen=1,
+                clip_count=3,
+                action_counts={"dribble": 2, "pass": 1},
+                needs_review_count=0,
+                average_confidence=0.7,
+            ),
+        ]
+        features = {
+            "segment_0:player_4": PlayerIdentityFeatureResponse(
+                player=4,
+                segment_id=0,
+                local_player_id="segment_0:player_4",
+                start_frame=0,
+                end_frame=100,
+                appearance_signature={"h_mean": 0.05, "s_mean": 0.8, "v_mean": 0.7, "b_mean": 0.1, "g_mean": 0.25, "r_mean": 0.9},
+                appearance_embedding=[0.8, 0.2, 0.1, 0.0],
+                embedding_model="test_embedding",
+                embedding_dim=4,
+            ),
+            "segment_2:player_6": PlayerIdentityFeatureResponse(
+                player=6,
+                segment_id=2,
+                local_player_id="segment_2:player_6",
+                start_frame=200,
+                end_frame=300,
+                appearance_signature={"h_mean": 0.06, "s_mean": 0.78, "v_mean": 0.72, "b_mean": 0.11, "g_mean": 0.24, "r_mean": 0.88},
+                appearance_embedding=[0.79, 0.21, 0.1, 0.0],
+                embedding_model="test_embedding",
+                embedding_dim=4,
+            ),
+        }
+        candidates = service._detect_identity_duplicate_candidates(summaries, features)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].left_global_player_id, "player_004")
+        self.assertEqual(candidates[0].right_global_player_id, "player_006")
+        self.assertGreater(candidates[0].confidence, 0.68)
+        self.assertEqual(candidates[0].recommended_action, "review_merge")
+
+    def test_identity_duplicate_candidates_respect_same_segment_conflict(self):
+        service = self.make_service()
+        summaries = [
+            LongVideoPlayerSummaryResponse(
+                player_id="segment_0:player_1",
+                global_player_id="player_001",
+                segments_seen=1,
+                clip_count=3,
+                action_counts={"dribble": 3},
+                needs_review_count=0,
+                average_confidence=0.7,
+            ),
+            LongVideoPlayerSummaryResponse(
+                player_id="segment_0:player_2",
+                global_player_id="player_002",
+                segments_seen=1,
+                clip_count=3,
+                action_counts={"dribble": 3},
+                needs_review_count=0,
+                average_confidence=0.7,
+            ),
+        ]
+        features = {
+            "segment_0:player_1": PlayerIdentityFeatureResponse(
+                player=1,
+                segment_id=0,
+                local_player_id="segment_0:player_1",
+                start_frame=0,
+                end_frame=100,
+                appearance_signature={"h_mean": 0.2, "s_mean": 0.5, "v_mean": 0.7, "b_mean": 0.1, "g_mean": 0.2, "r_mean": 0.3},
+                appearance_embedding=[0.8, 0.2, 0.1, 0.0],
+                embedding_model="test_embedding",
+                embedding_dim=4,
+            ),
+            "segment_0:player_2": PlayerIdentityFeatureResponse(
+                player=2,
+                segment_id=0,
+                local_player_id="segment_0:player_2",
+                start_frame=0,
+                end_frame=100,
+                appearance_signature={"h_mean": 0.2, "s_mean": 0.5, "v_mean": 0.7, "b_mean": 0.1, "g_mean": 0.2, "r_mean": 0.3},
+                appearance_embedding=[0.8, 0.2, 0.1, 0.0],
+                embedding_model="test_embedding",
+                embedding_dim=4,
+            ),
+        }
+        candidates = service._detect_identity_duplicate_candidates(summaries, features)
+        self.assertEqual(candidates, [])
 
     def test_temporal_smoothing_replaces_isolated_low_confidence_label(self):
         records = [
@@ -152,7 +533,7 @@ class HybridAnalysisTest(unittest.TestCase):
         windows_25 = crop_windows(frames_25, boxes_25, seq_length=16, vid_stride=8)
         self.assertEqual(len(windows_25[0]), 3)
 
-    def test_vlm_verifier_only_uses_response_field(self):
+    def test_vlm_verifier_parses_response_or_thinking(self):
         import json
         from unittest.mock import patch, MagicMock
         from app.analysis.vlm import OllamaVLMVerifier
@@ -180,13 +561,14 @@ class HybridAnalysisTest(unittest.TestCase):
             self.assertEqual(vlm_decision.action, "shoot")
             self.assertEqual(vlm_decision.confidence, 0.95)
             self.assertEqual(vlm_decision.reason, "visible shot")
-            
+
             mock_resp.read.return_value = json.dumps({
                 "thinking": '{"action": "shoot", "confidence": 0.95}'
             }).encode('utf-8')
             
             vlm_decision2 = verifier.verify(frames, prediction, motion)
-            self.assertIsNone(vlm_decision2.action)
+            self.assertEqual(vlm_decision2.action, "shoot")
+            self.assertEqual(vlm_decision2.confidence, 0.95)
 
     def test_lifespan_mounts_static_directories_with_absolute_paths(self):
         from unittest.mock import patch, MagicMock
@@ -418,7 +800,8 @@ class HybridAnalysisTest(unittest.TestCase):
              request = AnalysisRequest(
                  video_path="dummy.mp4",
                  vlm_mode="off",
-                 generate_video=True
+                 generate_video=True,
+                 segmented_analysis=False,
              )
 
              with self.assertRaises(Exception) as context:
@@ -501,7 +884,8 @@ class HybridAnalysisTest(unittest.TestCase):
              request = AnalysisRequest(
                  video_path="dummy.mp4",
                  vlm_mode="off",
-                 generate_video=False
+                 generate_video=False,
+                 segmented_analysis=False,
              )
 
              response = service.run_analysis(request)
@@ -630,7 +1014,84 @@ class HybridAnalysisTest(unittest.TestCase):
                     self.assertEqual(status_data["task_id"], task_id)
                     self.assertIn(status_data["status"], ["pending", "processing", "completed"])
 
+    def test_long_video_segment_ranges(self):
+        from unittest.mock import MagicMock
+        from app.analysis.service import AnalysisService
+        from app.config import Settings
+
+        service = AnalysisService(settings=Settings(), model=MagicMock(), device="cpu")
+        ranges = service._build_segment_ranges(
+            duration_sec=31.0,
+            fps=10.0,
+            frame_count=310,
+            segment_duration_sec=10.0,
+            segment_overlap_sec=2.0,
+            max_segments=None,
+        )
+
+        self.assertEqual(len(ranges), 4)
+        self.assertEqual(ranges[0]["start_frame"], 0)
+        self.assertEqual(ranges[0]["end_frame"], 99)
+        self.assertEqual(ranges[1]["start_frame"], 80)
+        self.assertEqual(ranges[-1]["end_frame"], 309)
+
+    def test_long_video_vlm_audit_detects_player_under_count(self):
+        from unittest.mock import MagicMock
+        from app.analysis.service import AnalysisService
+        from app.config import Settings
+        from app.analysis.schemas import AnalysisSummaryResponse, VLMVideoAuditResponse
+
+        service = AnalysisService(settings=Settings(), model=MagicMock(), device="cpu")
+        status, notes = service._compare_segment_with_vlm(
+            player_count=1,
+            summary=AnalysisSummaryResponse(
+                clip_count=3,
+                action_counts={"dribble": 2, "walk": 1},
+                needs_review_count=0,
+                source_counts={"r2plus1d": 3},
+            ),
+            vlm_audit=VLMVideoAuditResponse(
+                available=True,
+                player_count_min=5,
+                player_count_max=10,
+                actions=["dribble", "pass"],
+                confidence=0.9,
+            ),
+        )
+
+        self.assertEqual(status, "fail_player_under_count")
+        self.assertIn("VLM saw at least 5", notes[0])
+
+    def test_run_analysis_defaults_to_segmented_mode(self):
+        from unittest.mock import MagicMock, patch
+        from app.analysis.service import AnalysisService
+        from app.config import Settings
+        from app.analysis.schemas import AnalysisRequest
+
+        service = AnalysisService(settings=Settings(), model=MagicMock(), device="cpu")
+        request = AnalysisRequest(video_path="dummy.mp4", generate_video=False)
+
+        with patch.object(service, "run_long_video_analysis") as mock_long:
+            service.run_analysis(request)
+
+        mock_long.assert_called_once_with(request)
+
+    def test_player_statistics_estimate_from_action_counts(self):
+        from unittest.mock import MagicMock
+        from collections import Counter
+        from app.analysis.service import AnalysisService
+        from app.config import Settings
+
+        service = AnalysisService(settings=Settings(), model=MagicMock(), device="cpu")
+        stats = service._estimate_player_statistics(Counter({"shoot": 2, "pass": 3, "block": 1}))
+
+        self.assertEqual(stats.points, 4)
+        self.assertEqual(stats.assists, 3)
+        self.assertEqual(stats.blocks, 0)
+        self.assertTrue(any("block_candidate" in note for note in stats.notes))
+        self.assertEqual(stats.rebounds, 0)
+        self.assertEqual(stats.steals, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
-

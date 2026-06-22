@@ -14,12 +14,38 @@ from app.dependencies import init_globals
 from app.analysis.router import router as analysis_router
 
 
+def resolve_model_device(preference: str) -> torch.device:
+    if not isinstance(preference, str):
+        preference = "auto"
+    preference = (preference or "auto").lower()
+    if preference in {"auto", ""}:
+        return torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+    if preference == "mps_if_available":
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("cpu")
+    if preference == "mps" and not torch.backends.mps.is_available():
+        return torch.device("cpu")
+    if preference == "cuda" and not torch.cuda.is_available():
+        return torch.device("cpu")
+    return torch.device(preference)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """App lifespan context manager. Loads ML models on startup."""
     settings = get_settings()
     
-    device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+    try:
+        torch_num_threads = int(settings.torch_num_threads)
+    except (TypeError, ValueError):
+        torch_num_threads = 0
+    if torch_num_threads > 0:
+        torch.set_num_threads(torch_num_threads)
+
+    device = resolve_model_device(settings.r2plus1d_device)
     print(f"Loading R(2+1)D model on {device}...")
     model = build_r2plus1d_model(settings, device=device)
     init_globals(model=model, device=device)

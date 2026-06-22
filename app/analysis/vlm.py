@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 
 from app.analysis.inference import LABEL_TO_ID, LABELS
-from app.analysis.schemas import ModelPrediction, MotionFeatures, VLMDecisionResponse
+from app.analysis.schemas import ModelPrediction, MotionFeatures, VLMDecisionResponse, VLMVideoAuditResponse
 
 
 def normalize_action(value: Any) -> Optional[str]:
@@ -92,6 +92,51 @@ def extract_json_object(text: str) -> Dict[str, Any]:
     return json.loads(match.group(0))
 
 
+def parse_vlm_payload(body: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
+    """Parse Ollama response payload from generate/chat fields."""
+    errors: list[str] = []
+
+    candidates = []
+    response_raw = body.get("response")
+    thinking_raw = body.get("thinking")
+    message_raw = body.get("message")
+
+    if isinstance(response_raw, str):
+        candidates.append(("response", response_raw))
+    elif response_raw is not None:
+        candidates.append(("response", str(response_raw)))
+
+    if isinstance(thinking_raw, str):
+        candidates.append(("thinking", thinking_raw))
+    elif thinking_raw is not None:
+        candidates.append(("thinking", str(thinking_raw)))
+
+    if isinstance(message_raw, dict):
+        content_raw = message_raw.get("content")
+        message_thinking_raw = message_raw.get("thinking")
+        if isinstance(content_raw, str):
+            candidates.append(("message.content", content_raw))
+        elif content_raw is not None:
+            candidates.append(("message.content", str(content_raw)))
+        if isinstance(message_thinking_raw, str):
+            candidates.append(("message.thinking", message_thinking_raw))
+        elif message_thinking_raw is not None:
+            candidates.append(("message.thinking", str(message_thinking_raw)))
+
+    for source, raw in candidates:
+        if not raw:
+            continue
+        try:
+            return extract_json_object(raw), raw
+        except (ValueError, json.JSONDecodeError) as exc:
+            errors.append(f"{source}: {exc}")
+
+    if not errors:
+        return body, json.dumps(body)
+
+    raise ValueError("; ".join(errors))
+
+
 class OllamaVLMVerifier:
     """Client for verifying actions against a local Ollama VLM."""
 
@@ -167,12 +212,9 @@ class OllamaVLMVerifier:
                 available=False,
             )
 
-        raw = str(body.get("response") or "")
-        if not raw:
-            raw = json.dumps(body)
-            
+        raw = json.dumps(body)
         try:
-            parsed = extract_json_object(raw)
+            parsed, raw = parse_vlm_payload(body)
         except (ValueError, json.JSONDecodeError) as exc:
             return VLMDecisionResponse(
                 action=None,
@@ -196,6 +238,73 @@ class OllamaVLMVerifier:
             available=True,
         )
 
+    def audit_video_frames(
+        self,
+        frames: Sequence[np.ndarray],
+        scope: str,
+    ) -> VLMVideoAuditResponse:
+        """Ask the VLM to audit a segment contact sheet for player count and actions."""
+        images = encode_frames_jpeg(frames, max_width=640)
+        if not images:
+            return VLMVideoAuditResponse(
+                available=False,
+                limitations="No frames were available for VLM audit.",
+            )
+
+        payload = {
+            "model": self.model,
+            "stream": False,
+            "prompt": self._build_audit_prompt(scope),
+            "images": images,
+            "format": "json",
+            "options": {"temperature": 0.0, "num_predict": 700},
+        }
+        request = urllib.request.Request(
+            f"{self.host}/api/generate",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            return VLMVideoAuditResponse(
+                available=False,
+                limitations=f"Ollama VLM HTTP error {exc.code}: {detail}",
+                raw_response=detail,
+            )
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            return VLMVideoAuditResponse(
+                available=False,
+                limitations=f"Ollama VLM unavailable: {exc}",
+            )
+
+        raw = json.dumps(body)
+        try:
+            parsed, raw = parse_vlm_payload(body)
+        except (ValueError, json.JSONDecodeError) as exc:
+            return VLMVideoAuditResponse(
+                available=True,
+                confidence=0.0,
+                limitations=f"VLM returned non-JSON audit response: {exc}",
+                raw_response=raw,
+            )
+
+        return VLMVideoAuditResponse(
+            available=True,
+            player_count_min=_optional_int(parsed.get("player_count_min")),
+            player_count_max=_optional_int(parsed.get("player_count_max")),
+            visible_player_descriptions=_string_list(parsed.get("visible_player_descriptions")),
+            actions=_string_list(parsed.get("actions")),
+            main_state=str(parsed.get("main_state", "")),
+            confidence=clamp_float(parsed.get("confidence"), 0.0, 1.0, default=0.0),
+            limitations=str(parsed.get("limitations", "")),
+            raw_response=raw,
+        )
+
     def _build_prompt(self, prediction: ModelPrediction, motion: MotionFeatures) -> str:
         labels = ", ".join(LABELS.values())
         return (
@@ -212,3 +321,31 @@ class OllamaVLMVerifier:
             f"area_change_ratio={motion.area_change_ratio:.3f}.\n"
             "Use the visual evidence first. If unsure, set needs_review=true."
         )
+
+    def _build_audit_prompt(self, scope: str) -> str:
+        return (
+            "You are auditing a basketball video segment from a contact sheet. "
+            "Count visible players conservatively and identify the main basketball actions. "
+            "Return only compact JSON with keys: player_count_min, player_count_max, "
+            "visible_player_descriptions, actions, main_state, confidence, limitations. "
+            "Use action words from this set when possible: dribble, pass, shoot, defense, "
+            "run, walk, ball in hand, rebound, no_action. "
+            f"Segment scope: {scope}."
+        )
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _string_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []

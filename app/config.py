@@ -30,8 +30,25 @@ class Settings(BaseSettings):
     # --- Video pipeline ---
     seq_length: int = 16
     vid_stride: int = 8
+    action_vid_stride: int = 24
     batch_size: int = 8
+    r2plus1d_device: str = "mps_if_available"
+    yolo_device: str = "cpu"
+    tracking_fps: float = 8.0
+    yolo_imgsz: int = 320
+    max_players_per_segment: int = 12
+    torch_num_threads: int = 10
+    progress_log: bool = True
     tracker_type: str = "YOLO"  # CSRT | YOLO
+    tracker_backend: str = "bytetrack"  # bytetrack | botsort | custom
+    yolo_tracker_config: str = ""
+    yolo_reid_enabled: bool = False
+    yolo_reid_model: str = "auto"
+    identity_embedding_backend: str = "torchvision_mobilenet_v3_small"
+    identity_embedding_weights: str = "default"
+    identity_embedding_device: str = "mps_if_available"
+    identity_embedding_batch_size: int = 16
+    identity_embedding_allow_fallback: bool = True
     yolo_model_name: str = "yolov8n.pt"
     default_video: str = "examples/lebron_shoots.mp4"
 

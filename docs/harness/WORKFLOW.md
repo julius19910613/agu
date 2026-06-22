@@ -22,12 +22,14 @@ Inputs:
 - User request.
 - Existing code and docs.
 - Relevant entries in `docs/harness/TASK-BOARD.md`.
+- Relevant `llm-wiki` entries when the `llm-wiki` skill is available.
 
 Output:
 - A short task statement.
 - Scope and non-scope.
 - Acceptance criteria.
 - Known risks or open questions.
+- A note of what wiki context was read, or that `llm-wiki` was unavailable.
 
 Exit criteria:
 - The objective is specific enough to implement.
@@ -126,6 +128,9 @@ Default commands:
 
 Exit criteria:
 - Relevant checks pass, or failures are recorded with whether they are pre-existing, environment-related, or introduced by the change.
+- For service/API/config/inference/tracking/VLM/output-contract changes, the local service curl hook in `docs/harness/LOCAL-SERVICE-CURL-HOOK.md` has run, or the blocker is recorded.
+- `README.md` and `docs/api.md` have been checked against the changed code and updated when public startup, request, response, configuration, output, or checkpoint behavior changed.
+- Development decisions and lessons are written to `llm-wiki`, or queued in `docs/harness/LLM-WIKI-PENDING.md` if the skill is unavailable.
 - Final response reports what was changed and what verification ran.
 - `docs/harness/TASK-BOARD.md` is updated for non-trivial tasks.
 
@@ -139,9 +144,13 @@ Return here when:
 Use this for small, low-risk changes:
 
 1. Clarify the request and affected files.
-2. Implement the scoped change.
-3. Run a focused verification or explain why it was not run.
-4. Summarize the result.
+2. Read relevant `llm-wiki` context when available.
+3. Implement the scoped change.
+4. Run a focused verification or explain why it was not run.
+5. For runtime-facing changes, run the local service curl hook or record why it does not apply.
+6. Check README/API docs against code when public behavior or setup changed.
+7. Write lessons to `llm-wiki` when available, or queue them in `docs/harness/LLM-WIKI-PENDING.md`.
+8. Summarize the result.
 
 Do not use the compact workflow for changes involving API contracts, inference preprocessing, checkpoints, training behavior, output JSON/video formats, or security-sensitive configuration.
 
@@ -167,5 +176,7 @@ A task is complete only when all of the following are true:
 
 - The requested behavior or document change is implemented.
 - Relevant tests or checks have run, or an explicit reason is recorded.
+- Local service curl verification has run for runtime-facing changes, or an explicit blocker is recorded.
+- README/API documentation has been checked against current code and updated if needed.
 - Any changed public contract is reflected in docs or harness maps.
 - The final response names the verification performed and any residual risk.

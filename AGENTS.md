@@ -52,6 +52,24 @@ Copy `.env.example` to `.env` for local settings and keep secrets, generated out
   - `visual_coach`、`player_grouping`、`basketball` 视为外部/待接入系统，当前代码层仅做网关契约兼容。
   - 它们的 UI 与业务编排变更不在 AGU 仓库实现范围内。
 
+## 开源组件能力治理（Open Source Component Capability Governance）
+
+- AGU 作为开源篮球视频分析组件，功能开发必须优先评估可引用、可配置、可调用的开源能力，而不是默认自研完整实现。
+- 新增能力前必须先评估：
+  - 是否已有成熟开源组件可直接调用，例如检测、跟踪、ReID、OCR、姿态估计、球/篮筐检测、动作识别、事件检测、VLM audit、视频 IO 与可视化工具。
+  - 组件许可证是否兼容 AGU 的开源发布目标，是否允许商用、再分发和模型权重使用。
+  - 组件是否能在 AGU 的 Python/FastAPI 主栈内稳定调用；如需外部服务或 CLI，必须通过 adapter/registry/config 接入，避免把业务逻辑绑定到单一实现。
+  - 组件是否支持本地离线运行、可配置模型路径、可替换后端、CPU/MPS/CUDA 等不同硬件条件。
+  - 组件的输入输出是否能映射到 AGU 的稳定 API/schema，且不会破坏 v3 推理预处理契约。
+- AGU 内部实现边界：
+  - AGU 可以封装开源组件，提供统一分析 API、任务状态、标准 JSON 输出、VLM 抽检对账与置信度说明。
+  - AGU 不应把外部组件的临时 CLI 参数、模型路径或服务地址硬编码进业务流程；必须进入 `app/config.py`、`.env.example` 和 README/API 文档。
+  - AGU 不应为了单一实验引入长期维护成本过高的重型依赖；先用可选依赖、adapter、feature flag 或离线脚本验证。
+- 功能方案评审要求：
+  - 每个非平凡功能方案必须包含“可复用开源能力评估”和“AGU 自研/封装边界”两部分。
+  - 如果选择自研，必须说明现有开源组件为何不满足：许可证不兼容、无法本地部署、接口不可控、性能不足、模型不可获得、或与 AGU 输出契约冲突。
+  - 如果选择引用组件，必须说明 fallback、配置项、测试策略、输出兼容性和去耦方案。
+
 ## 语言治理与项目归一（Language Governance）
 
 - 禁止单仓库语言混用：
@@ -75,6 +93,12 @@ Copy `.env.example` to `.env` for local settings and keep secrets, generated out
 
 - 不得在代码中硬编码：
   - 线上 URL、密钥、数据库连接串、token、租户标识、实例地址、服务端口（除非是可运行 fallback）。
+- 禁止通过 hardcoding 定死环境变量：
+  - 不允许在业务代码、脚本或测试中用常量替代应由环境决定的值。
+  - 不允许绕过配置层直接写死某个环境的 URL、端口、路径、模型名、token、租户或实例标识。
+  - 所有可变环境配置必须从对应的 env 文件或平台环境变量读取，再经项目配置层使用。
+  - AGU 本地默认读取 `.env` / `.env.example` 对应的 `BASKETBALL_` 变量；线上由平台环境变量覆盖。
+  - 外部 BFF/API 网关配置必须从其归属项目的 env 文件读取，例如 `visual_coach` 使用 `BFF_*`、`AGU_BASE_URL`、`GROUPING_BASE_URL`。
 - 统一读取规则：
   - AGU：统一通过 `app/config.py` 的 `Settings`（`BASKETBALL_` 前缀）读取。
   - BFF：归属 `visual_coach`，由其 Rust 服务统一读取本地和线上环境变量（统一入口 `BFF_*`、`AGU_BASE_URL`、`GROUPING_BASE_URL`）。
@@ -119,6 +143,35 @@ Copy `.env.example` to `.env` for local settings and keep secrets, generated out
    - 回退路径需可在 5 分钟内切换完成，并保留 `request_id` 与 trace 日志用于对账。
 
 ## Codex Harness Rules
+
+## Codex LLM Wiki Hooks
+
+Every AGU development task must use the following two Codex hooks.
+
+1. Pre-development context hook
+   - Before implementing a development task, use the `llm-wiki` skill when it is available.
+   - Read wiki entries relevant to the user request, touched modules, API contracts, model/preprocessing behavior, deployment notes, and previous task decisions.
+   - Treat wiki content as project memory and context, not as a replacement for reading current code.
+   - If `llm-wiki` is unavailable, record that in the working notes or final response and continue with repository-local docs.
+   - For non-trivial work, mention the wiki context source or fallback in `docs/harness/TASK-BOARD.md` or the matching task artifact.
+
+2. Post-development knowledge hook
+   - After development and verification, summarize the implementation, decisions, changed files, verification commands, failures, and lessons learned.
+   - Write that summary back into `llm-wiki` using the `llm-wiki` skill when it is available.
+   - If `llm-wiki` is unavailable, append a pending entry to `docs/harness/LLM-WIKI-PENDING.md` so the knowledge can be imported later.
+   - Keep secrets, private paths, tokens, datasets, checkpoints, and generated outputs out of wiki summaries.
+
+## Codex Local Runtime Hook
+
+After AGU development tasks that change service code, API behavior, configuration, task orchestration, inference/tracking/VLM behavior, output schemas, or README/API contract content:
+
+1. Start the local FastAPI service.
+2. Verify `/health` and `/ready` with `curl`.
+3. Submit a lightweight `POST /api/v1/analysis/run` request with `curl` and confirm the response has the expected `task_id` / `status` shape.
+4. Query the task status endpoint with `curl`; for user-visible analysis behavior changes, poll until `completed` or record the exact failure.
+5. Check `README.md` against current code and `docs/api.md`; update README/API docs when request fields, response fields, startup commands, environment variables, output behavior, or model/checkpoint assumptions changed.
+
+Use the repeatable procedure in `docs/harness/LOCAL-SERVICE-CURL-HOOK.md`. If local service startup or curl verification cannot run because of environment constraints, record the blocker and the closest verification that did run.
 
 Use the workflow in `docs/harness/WORKFLOW.md` for changes that affect API contracts, inference preprocessing, training behavior, configuration, output JSON/video formats, or task orchestration. Small documentation-only or narrowly scoped test changes may use the compact workflow.
 
