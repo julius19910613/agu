@@ -128,6 +128,7 @@ class PlayerIdentityFeatureResponse(BaseModel):
     embedding_dim: int = 0
     track_coverage: float = 0.0
     method: str = "sidecar_hsv_hist_embedding_v1"
+    sampled_boxes: List[Dict[str, float]] = Field(default_factory=list)
 
 
 class EventCandidateResponse(BaseModel):

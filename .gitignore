@@ -79,7 +79,7 @@ claude.md
 gemini.md
 C3D.py
 hybrid_service.py
-analysis/
+/analysis/
 
 # OS-specific
 .DS_Store

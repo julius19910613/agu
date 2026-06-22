@@ -74,6 +74,7 @@ basketball video -> player tracks -> action clips -> structured JSON + optional 
   - `result.player_identity_features[]` 提供局部轨迹模型 appearance embedding 和 continuity 特征。
   - `result.long_video.players[]` 提供 segment-local 球员动作汇总和 `appearance_continuity_stitch_v2` 的轻量 `global_player_id` 身份候选。
   - `result.long_video.identity_duplicate_candidates[]` 提供疑似重复 `global_player_id` 的合并审核候选，不自动改写统计。
+  - duplicate candidate 会使用采样 frame-level bbox 判断同屏硬冲突和重复框重叠。
   - `result.long_video.event_candidates[]` 提供 `block_candidate`、`rebound_candidate`、`steal_candidate` 事件线索。
 - 推理加速：
   - `BASKETBALL_TRACKING_FPS=8.0` 对 YOLO 跟踪做低帧率采样。

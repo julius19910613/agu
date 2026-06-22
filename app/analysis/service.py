@@ -678,6 +678,7 @@ class AnalysisService:
             means: List[np.ndarray] = []
             crops: List[np.ndarray] = []
             centers: List[List[float]] = []
+            sampled_boxes: List[Dict[str, float]] = []
             valid_frames = 0
             first_frame = frame_offset
             last_frame = frame_offset + len(video_frames) - 1
@@ -702,6 +703,17 @@ class AnalysisService:
                 bgr_mean = crop_summary.reshape(-1, 3).mean(axis=0)
                 hsv_mean = hsv.reshape(-1, 3).mean(axis=0)
                 crops.append(crop)
+                sampled_boxes.append(
+                    {
+                        "frame": float(frame_offset + frame_index),
+                        "x": x,
+                        "y": y,
+                        "w": w,
+                        "h": h,
+                        "cx": x + w / 2.0,
+                        "cy": y + h / 2.0,
+                    }
+                )
                 means.append(
                     np.array(
                         [
@@ -745,6 +757,7 @@ class AnalysisService:
                     embedding_dim=int(embedding.shape[0]),
                     track_coverage=valid_frames / max(1, (len(video_frames) + sample_stride - 1) // sample_stride),
                     method=embedding_result.method,
+                    sampled_boxes=sampled_boxes,
                 )
             )
         return features
@@ -961,8 +974,14 @@ class AnalysisService:
             left_group = groups[left_gid]
             for right_gid in global_ids[index + 1 :]:
                 right_group = groups[right_gid]
-                shared_segments = sorted(left_group["segments"] & right_group["segments"])
-                if shared_segments:
+                conflict_evidence, overlap_similarity = self._identity_overlap_evidence(
+                    left_group["local_ids"],
+                    right_group["local_ids"],
+                    player_identity_features,
+                    left_group["segments"],
+                    right_group["segments"],
+                )
+                if conflict_evidence:
                     continue
 
                 appearance_similarity = self._group_appearance_similarity(
@@ -984,7 +1003,8 @@ class AnalysisService:
                     appearance_similarity * 0.50
                     + team_color_similarity * 0.20
                     + action_similarity * 0.15
-                    + temporal_similarity * 0.15
+                    + temporal_similarity * 0.10
+                    + overlap_similarity * 0.05
                 )
                 if score < 0.68:
                     continue
@@ -1001,7 +1021,8 @@ class AnalysisService:
                             f"team color similarity {team_color_similarity:.2f}",
                             f"action similarity {action_similarity:.2f}",
                             f"temporal compatibility {temporal_similarity:.2f}",
-                            "no same-segment hard conflict",
+                            f"bbox duplicate-overlap compatibility {overlap_similarity:.2f}",
+                            "no frame-level hard conflict",
                             f"left local tracks {len(left_group['local_ids'])}",
                             f"right local tracks {len(right_group['local_ids'])}",
                         ],
@@ -1079,6 +1100,87 @@ class AnalysisService:
         if min_gap <= 12:
             return 0.55
         return 0.40
+
+    def _identity_overlap_evidence(
+        self,
+        left_local_ids: List[str],
+        right_local_ids: List[str],
+        player_identity_features: Dict[str, PlayerIdentityFeatureResponse],
+        left_segments: set[int],
+        right_segments: set[int],
+    ) -> tuple[List[str], float]:
+        """Return hard conflict evidence and duplicate-overlap compatibility.
+
+        If same-frame sampled boxes are far apart, the pair is a hard conflict.
+        If same-frame boxes strongly overlap, they are likely duplicate detector
+        boxes and should not block a merge-review candidate.
+        """
+        shared_segments = sorted(left_segments & right_segments)
+        left_boxes = self._sampled_boxes_for_local_ids(left_local_ids, player_identity_features)
+        right_boxes = self._sampled_boxes_for_local_ids(right_local_ids, player_identity_features)
+        if not left_boxes or not right_boxes:
+            if shared_segments:
+                return (
+                    [
+                        "hard conflict: global IDs appear in same segment(s) without frame-level boxes "
+                        + ", ".join(str(segment) for segment in shared_segments[:8])
+                    ],
+                    0.0,
+                )
+            return [], 0.35
+
+        right_by_frame: Dict[int, List[Dict[str, float]]] = defaultdict(list)
+        for box in right_boxes:
+            right_by_frame[int(round(float(box.get("frame", -1))))].append(box)
+
+        same_frame_ious: List[float] = []
+        for left_box in left_boxes:
+            frame = int(round(float(left_box.get("frame", -1))))
+            for right_box in right_by_frame.get(frame, []):
+                iou = self._box_iou(left_box, right_box)
+                same_frame_ious.append(iou)
+                if iou < 0.20:
+                    return [f"hard conflict: same frame {frame} has separated boxes iou={iou:.2f}"], 0.0
+
+        if same_frame_ious:
+            return [], max(same_frame_ious)
+        if shared_segments:
+            return [], 0.25
+        return [], 0.35
+
+    def _sampled_boxes_for_local_ids(
+        self,
+        local_ids: List[str],
+        player_identity_features: Dict[str, PlayerIdentityFeatureResponse],
+    ) -> List[Dict[str, float]]:
+        boxes: List[Dict[str, float]] = []
+        for local_id in local_ids:
+            feature = player_identity_features.get(local_id)
+            if feature is None:
+                continue
+            boxes.extend(feature.sampled_boxes)
+        return boxes
+
+    def _box_iou(self, left: Dict[str, float], right: Dict[str, float]) -> float:
+        left_x1 = float(left.get("x", 0.0))
+        left_y1 = float(left.get("y", 0.0))
+        left_x2 = left_x1 + max(0.0, float(left.get("w", 0.0)))
+        left_y2 = left_y1 + max(0.0, float(left.get("h", 0.0)))
+        right_x1 = float(right.get("x", 0.0))
+        right_y1 = float(right.get("y", 0.0))
+        right_x2 = right_x1 + max(0.0, float(right.get("w", 0.0)))
+        right_y2 = right_y1 + max(0.0, float(right.get("h", 0.0)))
+        inter_x1 = max(left_x1, right_x1)
+        inter_y1 = max(left_y1, right_y1)
+        inter_x2 = min(left_x2, right_x2)
+        inter_y2 = min(left_y2, right_y2)
+        inter_area = max(0.0, inter_x2 - inter_x1) * max(0.0, inter_y2 - inter_y1)
+        left_area = max(0.0, left_x2 - left_x1) * max(0.0, left_y2 - left_y1)
+        right_area = max(0.0, right_x2 - right_x1) * max(0.0, right_y2 - right_y1)
+        union = left_area + right_area - inter_area
+        if union <= 0.0:
+            return 0.0
+        return max(0.0, min(1.0, inter_area / union))
 
     def _detect_event_candidates(
         self,

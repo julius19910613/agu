@@ -458,6 +458,109 @@ class HybridAnalysisTest(unittest.TestCase):
         candidates = service._detect_identity_duplicate_candidates(summaries, features)
         self.assertEqual(candidates, [])
 
+    def test_identity_duplicate_candidates_allow_same_frame_duplicate_boxes(self):
+        service = self.make_service()
+        summaries = [
+            LongVideoPlayerSummaryResponse(
+                player_id="segment_0:player_1",
+                global_player_id="player_001",
+                segments_seen=1,
+                clip_count=3,
+                action_counts={"dribble": 3},
+                needs_review_count=0,
+                average_confidence=0.7,
+            ),
+            LongVideoPlayerSummaryResponse(
+                player_id="segment_0:player_2",
+                global_player_id="player_002",
+                segments_seen=1,
+                clip_count=3,
+                action_counts={"dribble": 3},
+                needs_review_count=0,
+                average_confidence=0.7,
+            ),
+        ]
+        features = {
+            "segment_0:player_1": PlayerIdentityFeatureResponse(
+                player=1,
+                segment_id=0,
+                local_player_id="segment_0:player_1",
+                start_frame=0,
+                end_frame=100,
+                appearance_signature={"h_mean": 0.2, "s_mean": 0.5, "v_mean": 0.7, "b_mean": 0.1, "g_mean": 0.2, "r_mean": 0.3},
+                appearance_embedding=[0.8, 0.2, 0.1, 0.0],
+                embedding_model="test_embedding",
+                embedding_dim=4,
+                sampled_boxes=[{"frame": 10, "x": 100, "y": 100, "w": 80, "h": 160}],
+            ),
+            "segment_0:player_2": PlayerIdentityFeatureResponse(
+                player=2,
+                segment_id=0,
+                local_player_id="segment_0:player_2",
+                start_frame=0,
+                end_frame=100,
+                appearance_signature={"h_mean": 0.2, "s_mean": 0.5, "v_mean": 0.7, "b_mean": 0.1, "g_mean": 0.2, "r_mean": 0.3},
+                appearance_embedding=[0.8, 0.2, 0.1, 0.0],
+                embedding_model="test_embedding",
+                embedding_dim=4,
+                sampled_boxes=[{"frame": 10, "x": 104, "y": 104, "w": 80, "h": 160}],
+            ),
+        }
+        candidates = service._detect_identity_duplicate_candidates(summaries, features)
+        self.assertEqual(len(candidates), 1)
+        self.assertIn("bbox duplicate-overlap compatibility", " ".join(candidates[0].evidence))
+
+    def test_identity_duplicate_candidates_reject_same_frame_separated_boxes(self):
+        service = self.make_service()
+        summaries = [
+            LongVideoPlayerSummaryResponse(
+                player_id="segment_0:player_1",
+                global_player_id="player_001",
+                segments_seen=1,
+                clip_count=3,
+                action_counts={"dribble": 3},
+                needs_review_count=0,
+                average_confidence=0.7,
+            ),
+            LongVideoPlayerSummaryResponse(
+                player_id="segment_0:player_2",
+                global_player_id="player_002",
+                segments_seen=1,
+                clip_count=3,
+                action_counts={"dribble": 3},
+                needs_review_count=0,
+                average_confidence=0.7,
+            ),
+        ]
+        features = {
+            "segment_0:player_1": PlayerIdentityFeatureResponse(
+                player=1,
+                segment_id=0,
+                local_player_id="segment_0:player_1",
+                start_frame=0,
+                end_frame=100,
+                appearance_signature={"h_mean": 0.2, "s_mean": 0.5, "v_mean": 0.7, "b_mean": 0.1, "g_mean": 0.2, "r_mean": 0.3},
+                appearance_embedding=[0.8, 0.2, 0.1, 0.0],
+                embedding_model="test_embedding",
+                embedding_dim=4,
+                sampled_boxes=[{"frame": 10, "x": 100, "y": 100, "w": 80, "h": 160}],
+            ),
+            "segment_0:player_2": PlayerIdentityFeatureResponse(
+                player=2,
+                segment_id=0,
+                local_player_id="segment_0:player_2",
+                start_frame=0,
+                end_frame=100,
+                appearance_signature={"h_mean": 0.2, "s_mean": 0.5, "v_mean": 0.7, "b_mean": 0.1, "g_mean": 0.2, "r_mean": 0.3},
+                appearance_embedding=[0.8, 0.2, 0.1, 0.0],
+                embedding_model="test_embedding",
+                embedding_dim=4,
+                sampled_boxes=[{"frame": 10, "x": 400, "y": 100, "w": 80, "h": 160}],
+            ),
+        }
+        candidates = service._detect_identity_duplicate_candidates(summaries, features)
+        self.assertEqual(candidates, [])
+
     def test_offline_duplicate_report_recomputes_candidates(self):
         analysis = {
             "video": "example.mov",

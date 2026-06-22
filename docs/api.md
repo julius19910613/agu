@@ -165,6 +165,7 @@ explicit lightweight fallback.
 | `embedding_dim` | integer | Embedding vector length |
 | `track_coverage` | number | Fraction of sampled frames with usable boxes |
 | `method` | string | Feature extraction method |
+| `sampled_boxes` | array | Sampled frame-level boxes used for duplicate-ID conflict and overlap checks |
 
 ## Long Video Mode
 
