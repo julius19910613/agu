@@ -401,6 +401,11 @@ high_confidence           可选，覆盖高置信度阈值
 ./venv/bin/python scripts/gen_augmented.py --minority-only --multiplier 3
 ./venv/bin/python scripts/gen_splits.py --annotation-path dataset/annotation_dict.json
 ./venv/bin/python scripts/manual_test_run.py
+./venv/bin/python scripts/build_identity_duplicate_report.py \
+  --analysis-json analysis_outputs/<analysis-id>.json \
+  --output-json analysis_outputs/perf_runs/identity-duplicate-report.json \
+  --screenshot-dir analysis_outputs/player_stat_screenshots_20260622 \
+  --contact-sheet analysis_outputs/perf_runs/identity-duplicate-review.jpg
 ```
 
 ### Legacy 入口状态
@@ -482,4 +487,3 @@ Useful docs:
 - Extensions: `docs/extensions.md`
 - Open-source release notes: `docs/release-notes.md`
 - Harness workflow and task board: `docs/harness/WORKFLOW.md`, `docs/harness/TASK-BOARD.md`
-

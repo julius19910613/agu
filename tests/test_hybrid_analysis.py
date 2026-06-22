@@ -19,6 +19,7 @@ from app.analysis.service import AnalysisService
 from app.analysis.vlm import extract_json_object, normalize_action
 from app.analysis.fusion import fuse_decision, should_call_vlm, apply_temporal_smoothing
 from app.analysis.tracking import crop_windows, resolve_yolo_tracker_config, select_active_track_ids
+from scripts.build_identity_duplicate_report import build_duplicate_report
 
 
 class HybridAnalysisTest(unittest.TestCase):
@@ -456,6 +457,65 @@ class HybridAnalysisTest(unittest.TestCase):
         }
         candidates = service._detect_identity_duplicate_candidates(summaries, features)
         self.assertEqual(candidates, [])
+
+    def test_offline_duplicate_report_recomputes_candidates(self):
+        analysis = {
+            "video": "example.mov",
+            "identity_embedding_model": "test_embedding",
+            "player_identity_features": [
+                {
+                    "player": 4,
+                    "segment_id": 0,
+                    "local_player_id": "segment_0:player_4",
+                    "start_frame": 0,
+                    "end_frame": 100,
+                    "appearance_signature": {"h_mean": 0.05, "s_mean": 0.8, "v_mean": 0.7, "b_mean": 0.1, "g_mean": 0.25, "r_mean": 0.9},
+                    "appearance_embedding": [0.8, 0.2, 0.1, 0.0],
+                    "embedding_model": "test_embedding",
+                    "embedding_dim": 4,
+                },
+                {
+                    "player": 6,
+                    "segment_id": 2,
+                    "local_player_id": "segment_2:player_6",
+                    "start_frame": 200,
+                    "end_frame": 300,
+                    "appearance_signature": {"h_mean": 0.06, "s_mean": 0.78, "v_mean": 0.72, "b_mean": 0.11, "g_mean": 0.24, "r_mean": 0.88},
+                    "appearance_embedding": [0.79, 0.21, 0.1, 0.0],
+                    "embedding_model": "test_embedding",
+                    "embedding_dim": 4,
+                },
+            ],
+            "long_video": {
+                "players": [
+                    {
+                        "player_id": "segment_0:player_4",
+                        "global_player_id": "player_004",
+                        "identity_confidence": 0.25,
+                        "segments_seen": 1,
+                        "clip_count": 3,
+                        "action_counts": {"dribble": 2, "pass": 1},
+                        "needs_review_count": 0,
+                        "average_confidence": 0.7,
+                    },
+                    {
+                        "player_id": "segment_2:player_6",
+                        "global_player_id": "player_006",
+                        "identity_confidence": 0.25,
+                        "segments_seen": 1,
+                        "clip_count": 3,
+                        "action_counts": {"dribble": 2, "pass": 1},
+                        "needs_review_count": 0,
+                        "average_confidence": 0.7,
+                    },
+                ],
+                "identity_duplicate_candidates": [],
+            },
+        }
+        report = build_duplicate_report(analysis, source_path="analysis.json")
+        self.assertEqual(report["candidate_count"], 1)
+        self.assertEqual(report["candidate_source"], "recomputed_from_players_and_identity_features")
+        self.assertEqual(report["candidates"][0]["recommended_action"], "review_merge")
 
     def test_temporal_smoothing_replaces_isolated_low_confidence_label(self):
         records = [
