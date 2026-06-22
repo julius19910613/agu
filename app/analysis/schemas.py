@@ -114,6 +114,15 @@ class LongVideoPlayerSummaryResponse(BaseModel):
     statistics: PlayerBoxScoreEstimateResponse = Field(default_factory=PlayerBoxScoreEstimateResponse)
 
 
+class JerseyNumberCandidateResponse(BaseModel):
+    number: Optional[str] = None
+    confidence: float = 0.0
+    visible: bool = False
+    source: str = "vlm_jersey_number_v1"
+    reason: str = ""
+    raw_response: str = ""
+
+
 class PlayerIdentityFeatureResponse(BaseModel):
     player: int
     segment_id: Optional[int] = None
@@ -129,6 +138,7 @@ class PlayerIdentityFeatureResponse(BaseModel):
     track_coverage: float = 0.0
     method: str = "sidecar_hsv_hist_embedding_v1"
     sampled_boxes: List[Dict[str, float]] = Field(default_factory=list)
+    jersey_number_candidates: List[JerseyNumberCandidateResponse] = Field(default_factory=list)
 
 
 class EventCandidateResponse(BaseModel):
@@ -214,6 +224,8 @@ class AnalysisRequest(BaseModel):
     identity_embedding_backend: Optional[str] = Field(default=None, description="Optional identity embedding backend: torchvision_mobilenet_v3_small or sidecar_hsv_hist.")
     identity_embedding_weights: Optional[str] = Field(default=None, description="Optional identity embedding weights: default, imagenet1k_v1, or none.")
     identity_embedding_device: Optional[str] = Field(default=None, description="Optional identity embedding device: auto, cpu, cuda, mps, or mps_if_available.")
+    jersey_number_vlm_enabled: Optional[bool] = Field(default=None, description="If True, ask the configured VLM to read jersey numbers from sampled player crops.")
+    jersey_number_vlm_frames: Optional[int] = Field(default=None, description="Number of sampled player crops to send for jersey number VLM recognition.")
     r2plus1d_device: Optional[str] = Field(default=None, description="Optional R(2+1)D device override: auto, cpu, cuda, mps, or mps_if_available.")
     low_confidence: Optional[float] = Field(default=None, description="Override default low_confidence threshold.")
     high_confidence: Optional[float] = Field(default=None, description="Override default high_confidence threshold.")

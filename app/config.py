@@ -60,6 +60,8 @@ class Settings(BaseSettings):
     vlm_frames: int = 1
     vlm_image_width: int = 224
     max_vlm_clips: int = 8
+    jersey_number_vlm_enabled: bool = False
+    jersey_number_vlm_frames: int = 2
 
     # --- Confidence thresholds ---
     low_confidence: float = 0.45

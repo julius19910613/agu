@@ -166,6 +166,7 @@ explicit lightweight fallback.
 | `track_coverage` | number | Fraction of sampled frames with usable boxes |
 | `method` | string | Feature extraction method |
 | `sampled_boxes` | array | Sampled frame-level boxes used for duplicate-ID conflict and overlap checks |
+| `jersey_number_candidates` | array | Optional VLM/OCR jersey-number candidates for this local track |
 
 ## Long Video Mode
 
@@ -200,6 +201,8 @@ Important request fields:
 | `identity_embedding_backend` | string or null | Optional identity embedding backend: `torchvision_mobilenet_v3_small` or `sidecar_hsv_hist` |
 | `identity_embedding_weights` | string or null | Optional identity embedding weights: `default`, `imagenet1k_v1`, or `none` |
 | `identity_embedding_device` | string or null | Optional identity embedding device: `auto`, `cpu`, `cuda`, `mps`, or `mps_if_available` |
+| `jersey_number_vlm_enabled` | boolean or null | Enables optional VLM jersey-number reading from sampled player crops |
+| `jersey_number_vlm_frames` | integer or null | Number of player crops sent to VLM for jersey-number reading |
 | `r2plus1d_device` | string or null | Optional R(2+1)D device override: `auto`, `cpu`, `cuda`, `mps`, or `mps_if_available` |
 
 `result.long_video.segments[]` contains segment-level summary and VLM audit status:

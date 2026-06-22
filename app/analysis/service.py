@@ -123,6 +123,16 @@ class AnalysisService:
         effective_identity_backend = request.identity_embedding_backend or self.settings.identity_embedding_backend
         effective_identity_weights = request.identity_embedding_weights or self.settings.identity_embedding_weights
         effective_identity_device = request.identity_embedding_device or self.settings.identity_embedding_device
+        effective_jersey_number_vlm_enabled = (
+            request.jersey_number_vlm_enabled
+            if request.jersey_number_vlm_enabled is not None
+            else getattr(self.settings, "jersey_number_vlm_enabled", False)
+        )
+        effective_jersey_number_vlm_frames = (
+            request.jersey_number_vlm_frames
+            if request.jersey_number_vlm_frames is not None
+            else getattr(self.settings, "jersey_number_vlm_frames", 2)
+        )
         inference_device = self._resolve_r2plus1d_device(request)
         model = self._ensure_model_device(inference_device)
         
@@ -184,6 +194,14 @@ class AnalysisService:
                 host=self.settings.ollama_host,
                 timeout=self.settings.ollama_timeout,
                 image_width=self.settings.vlm_image_width,
+            )
+        jersey_number_verifier: Optional[OllamaVLMVerifier] = None
+        if effective_jersey_number_vlm_enabled:
+            jersey_number_verifier = OllamaVLMVerifier(
+                model=self.settings.ollama_model,
+                host=self.settings.ollama_host,
+                timeout=self.settings.ollama_timeout,
+                image_width=max(384, int(self.settings.vlm_image_width)),
             )
 
         # 5. Fusion & Verification
@@ -249,6 +267,8 @@ class AnalysisService:
             embedding_backend=effective_identity_backend,
             embedding_weights=effective_identity_weights,
             embedding_device=effective_identity_device,
+            jersey_number_verifier=jersey_number_verifier,
+            jersey_number_frames=effective_jersey_number_vlm_frames,
         )
         identity_embedding_model = (
             player_identity_features[0].embedding_model
@@ -659,6 +679,8 @@ class AnalysisService:
         embedding_backend: Optional[str] = None,
         embedding_weights: Optional[str] = None,
         embedding_device: Optional[str] = None,
+        jersey_number_verifier: Optional[OllamaVLMVerifier] = None,
+        jersey_number_frames: int = 2,
     ) -> List[PlayerIdentityFeatureResponse]:
         """Extract lightweight appearance and continuity features for player tracks."""
         if not video_frames or not player_boxes:
@@ -735,6 +757,13 @@ class AnalysisService:
             signature = np.stack(means, axis=0).mean(axis=0)
             embedding_result = embedder.embed_crops(crops)
             embedding = embedding_result.embedding
+            jersey_number_candidates = []
+            if jersey_number_verifier is not None:
+                jersey_frames = self._select_jersey_number_frames(crops, jersey_number_frames)
+                jersey_number_candidates = jersey_number_verifier.read_jersey_number(
+                    jersey_frames,
+                    scope=f"player_{player}",
+                )
             first_center = centers[0] if centers else []
             last_center = centers[-1] if centers else []
             features.append(
@@ -758,9 +787,21 @@ class AnalysisService:
                     track_coverage=valid_frames / max(1, (len(video_frames) + sample_stride - 1) // sample_stride),
                     method=embedding_result.method,
                     sampled_boxes=sampled_boxes,
+                    jersey_number_candidates=jersey_number_candidates,
                 )
             )
         return features
+
+    def _select_jersey_number_frames(
+        self,
+        crops: List[np.ndarray],
+        max_frames: int,
+    ) -> List[np.ndarray]:
+        if not crops:
+            return []
+        limit = max(1, int(max_frames or 1))
+        sorted_crops = sorted(crops, key=lambda crop: crop.shape[0] * crop.shape[1], reverse=True)
+        return sorted_crops[:limit]
 
     def _get_identity_embedder(
         self,

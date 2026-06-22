@@ -11,7 +11,13 @@ import cv2
 import numpy as np
 
 from app.analysis.inference import LABEL_TO_ID, LABELS
-from app.analysis.schemas import ModelPrediction, MotionFeatures, VLMDecisionResponse, VLMVideoAuditResponse
+from app.analysis.schemas import (
+    JerseyNumberCandidateResponse,
+    ModelPrediction,
+    MotionFeatures,
+    VLMDecisionResponse,
+    VLMVideoAuditResponse,
+)
 
 
 def normalize_action(value: Any) -> Optional[str]:
@@ -305,6 +311,58 @@ class OllamaVLMVerifier:
             raw_response=raw,
         )
 
+    def read_jersey_number(
+        self,
+        frames: Sequence[np.ndarray],
+        scope: str = "",
+    ) -> List[JerseyNumberCandidateResponse]:
+        """Ask the VLM to read a player's jersey number from sampled crops."""
+        images = encode_frames_jpeg(frames, max_width=max(384, self.image_width))
+        if not images:
+            return []
+
+        payload = {
+            "model": self.model,
+            "stream": False,
+            "prompt": self._build_jersey_number_prompt(scope),
+            "images": images,
+            "format": "json",
+            "options": {"temperature": 0.0, "num_predict": 180},
+        }
+        request = urllib.request.Request(
+            f"{self.host}/api/generate",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+            return []
+
+        raw = json.dumps(body)
+        try:
+            parsed, raw = parse_vlm_payload(body)
+        except (ValueError, json.JSONDecodeError):
+            return []
+
+        number = _normalize_jersey_number(parsed.get("number"))
+        confidence = clamp_float(parsed.get("confidence"), 0.0, 1.0, default=0.0)
+        visible = bool(parse_optional_bool(parsed.get("visible")))
+        if not number or confidence < 0.20:
+            return []
+        return [
+            JerseyNumberCandidateResponse(
+                number=number,
+                confidence=confidence,
+                visible=visible,
+                reason=str(parsed.get("reason", "")),
+                raw_response=raw,
+            )
+        ]
+
     def _build_prompt(self, prediction: ModelPrediction, motion: MotionFeatures) -> str:
         labels = ", ".join(LABELS.values())
         return (
@@ -333,6 +391,16 @@ class OllamaVLMVerifier:
             f"Segment scope: {scope}."
         )
 
+    def _build_jersey_number_prompt(self, scope: str) -> str:
+        return (
+            "You are reading a basketball player's jersey number from cropped player images. "
+            "Return only compact JSON with keys: number, confidence, visible, reason. "
+            "Use number as a string preserving leading zeroes such as \"00\". "
+            "If no jersey number is visible, return number as null, confidence 0, visible false. "
+            "Be conservative: do not guess when the crop is blurry, occluded, or only shows a face. "
+            f"Scope: {scope}."
+        )
+
 
 def _optional_int(value: Any) -> Optional[int]:
     try:
@@ -349,3 +417,15 @@ def _string_list(value: Any) -> List[str]:
     if isinstance(value, str) and value.strip():
         return [value.strip()]
     return []
+
+
+def _normalize_jersey_number(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "null", "unknown", "n/a"}:
+        return None
+    match = re.search(r"\d{1,2}", text)
+    if not match:
+        return None
+    return match.group(0)

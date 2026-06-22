@@ -72,6 +72,7 @@ basketball video -> player tracks -> action clips -> structured JSON + optional 
   - `segmented_analysis=true`，通过 `segment_duration_sec` 和 `segment_overlap_sec` 控制 segment。
   - `result.long_video.segments[]` 提供分段统计与 VLM audit 状态。
   - `result.player_identity_features[]` 提供局部轨迹模型 appearance embedding 和 continuity 特征。
+  - 可选 `BASKETBALL_JERSEY_NUMBER_VLM_ENABLED=true` 后，`player_identity_features[].jersey_number_candidates[]` 会输出 VLM 读取到的球衣号码候选。
   - `result.long_video.players[]` 提供 segment-local 球员动作汇总和 `appearance_continuity_stitch_v2` 的轻量 `global_player_id` 身份候选。
   - `result.long_video.identity_duplicate_candidates[]` 提供疑似重复 `global_player_id` 的合并审核候选，不自动改写统计。
   - duplicate candidate 会使用采样 frame-level bbox 判断同屏硬冲突和重复框重叠。
@@ -266,6 +267,8 @@ BASKETBALL_VLM_MODE=low-confidence
 BASKETBALL_OLLAMA_MODEL=qwen3-vl:4b
 BASKETBALL_OLLAMA_HOST=http://127.0.0.1:11434
 BASKETBALL_OLLAMA_TIMEOUT=45.0
+BASKETBALL_JERSEY_NUMBER_VLM_ENABLED=false
+BASKETBALL_JERSEY_NUMBER_VLM_FRAMES=2
 BASKETBALL_LOW_CONFIDENCE=0.45
 BASKETBALL_HIGH_CONFIDENCE=0.70
 BASKETBALL_SMOOTHING_CONFIDENCE=0.60

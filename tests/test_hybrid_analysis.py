@@ -9,6 +9,7 @@ from app.analysis.schemas import (
     AnalysisRecordResponse,
     AnalysisRequest,
     FinalDecisionResponse,
+    JerseyNumberCandidateResponse,
     LongVideoPlayerSummaryResponse,
     ModelPrediction,
     MotionFeatures,
@@ -56,6 +57,8 @@ class HybridAnalysisTest(unittest.TestCase):
         settings.identity_embedding_device = "cpu"
         settings.identity_embedding_batch_size = 2
         settings.identity_embedding_allow_fallback = True
+        settings.jersey_number_vlm_enabled = False
+        settings.jersey_number_vlm_frames = 2
         return AnalysisService(settings=settings, model=MagicMock(), device=torch.device("cpu"))
 
     def make_record(self, player, action, start_frame, end_frame, segment_id=0, confidence=0.7):
@@ -156,6 +159,8 @@ class HybridAnalysisTest(unittest.TestCase):
             identity_embedding_backend="torchvision_mobilenet_v3_small",
             identity_embedding_weights="none",
             identity_embedding_device="cpu",
+            jersey_number_vlm_enabled=True,
+            jersey_number_vlm_frames=2,
             r2plus1d_device="mps_if_available",
         )
         self.assertEqual(request.action_vid_stride, 24)
@@ -170,6 +175,8 @@ class HybridAnalysisTest(unittest.TestCase):
         self.assertEqual(request.identity_embedding_backend, "torchvision_mobilenet_v3_small")
         self.assertEqual(request.identity_embedding_weights, "none")
         self.assertEqual(request.identity_embedding_device, "cpu")
+        self.assertTrue(request.jersey_number_vlm_enabled)
+        self.assertEqual(request.jersey_number_vlm_frames, 2)
         self.assertEqual(request.r2plus1d_device, "mps_if_available")
 
     def test_yolo_tracker_adapter_config_resolution(self):
@@ -314,6 +321,34 @@ class HybridAnalysisTest(unittest.TestCase):
         self.assertEqual(features[0].embedding_model, "torchvision_mobilenet_v3_small_none_embedding_v1")
         self.assertEqual(features[0].embedding_dim, 576)
         self.assertEqual(len(features[0].appearance_embedding), 576)
+
+    def test_identity_feature_extraction_can_attach_jersey_number_candidates(self):
+        class FakeJerseyVerifier:
+            def read_jersey_number(self, frames, scope=""):
+                self.frames = frames
+                self.scope = scope
+                return [
+                    JerseyNumberCandidateResponse(
+                        number="00",
+                        confidence=0.82,
+                        visible=True,
+                        reason="visible back jersey",
+                    )
+                ]
+
+        service = self.make_service()
+        frames = [np.full((48, 48, 3), fill_value=80 + index, dtype=np.uint8) for index in range(2)]
+        boxes = [[(4.0, 4.0, 24.0, 28.0)]] * 2
+        verifier = FakeJerseyVerifier()
+        features = service._extract_player_identity_features(
+            frames,
+            boxes,
+            jersey_number_verifier=verifier,
+            jersey_number_frames=1,
+        )
+        self.assertEqual(features[0].jersey_number_candidates[0].number, "00")
+        self.assertEqual(features[0].jersey_number_candidates[0].confidence, 0.82)
+        self.assertEqual(len(verifier.frames), 1)
 
     def test_identity_stitch_does_not_merge_players_within_same_segment(self):
         service = self.make_service()
