@@ -8,6 +8,7 @@ import torch
 from app.analysis.schemas import (
     AnalysisRecordResponse,
     AnalysisRequest,
+    ConfirmedIdentityMergeResponse,
     FinalDecisionResponse,
     JerseyNumberCandidateResponse,
     LongVideoPlayerSummaryResponse,
@@ -161,6 +162,15 @@ class HybridAnalysisTest(unittest.TestCase):
             identity_embedding_device="cpu",
             jersey_number_vlm_enabled=True,
             jersey_number_vlm_frames=2,
+            confirmed_identity_merges=[
+                ConfirmedIdentityMergeResponse(
+                    canonical_global_player_id="player_004",
+                    merged_global_player_ids=["player_006"],
+                    source="manual_review",
+                    confidence=0.95,
+                    evidence=["same jersey number and appearance"],
+                )
+            ],
             r2plus1d_device="mps_if_available",
         )
         self.assertEqual(request.action_vid_stride, 24)
@@ -177,6 +187,8 @@ class HybridAnalysisTest(unittest.TestCase):
         self.assertEqual(request.identity_embedding_device, "cpu")
         self.assertTrue(request.jersey_number_vlm_enabled)
         self.assertEqual(request.jersey_number_vlm_frames, 2)
+        self.assertEqual(request.confirmed_identity_merges[0].canonical_global_player_id, "player_004")
+        self.assertEqual(request.confirmed_identity_merges[0].merged_global_player_ids, ["player_006"])
         self.assertEqual(request.r2plus1d_device, "mps_if_available")
 
     def test_yolo_tracker_adapter_config_resolution(self):
@@ -216,6 +228,59 @@ class HybridAnalysisTest(unittest.TestCase):
         self.assertEqual(stats.points, 2)
         self.assertEqual(stats.blocks, 0)
         self.assertTrue(any("block_candidate" in note for note in stats.notes))
+
+    def test_confirmed_identity_merges_emit_merged_player_statistics(self):
+        service = self.make_service()
+        summaries = [
+            LongVideoPlayerSummaryResponse(
+                player_id="segment_0:player_4",
+                global_player_id="player_004",
+                identity_confidence=0.42,
+                identity_method="appearance_continuity_stitch_v2",
+                identity_evidence=["embedding similarity 0.91"],
+                segments_seen=1,
+                clip_count=4,
+                action_counts={"shoot": 2, "pass": 1, "rebound": 1},
+                needs_review_count=1,
+                average_confidence=0.7,
+            ),
+            LongVideoPlayerSummaryResponse(
+                player_id="segment_2:player_6",
+                global_player_id="player_006",
+                identity_confidence=0.38,
+                identity_method="appearance_continuity_stitch_v2",
+                identity_evidence=["jersey number 00"],
+                segments_seen=1,
+                clip_count=3,
+                action_counts={"steal": 1, "block": 1, "shoot": 1},
+                needs_review_count=0,
+                average_confidence=0.8,
+            ),
+        ]
+        merged = service._build_confirmed_merged_player_summaries(
+            summaries,
+            [
+                ConfirmedIdentityMergeResponse(
+                    canonical_global_player_id="player_004",
+                    merged_global_player_ids=["player_006"],
+                    source="manual_review",
+                    confidence=0.96,
+                    evidence=["review contact sheet confirmed same player"],
+                )
+            ],
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].global_player_id, "player_004")
+        self.assertEqual(merged[0].merged_from_global_player_ids, ["player_004", "player_006"])
+        self.assertEqual(merged[0].segments_seen, 2)
+        self.assertEqual(merged[0].clip_count, 7)
+        self.assertEqual(merged[0].action_counts["shoot"], 3)
+        self.assertEqual(merged[0].statistics.points, 6)
+        self.assertEqual(merged[0].statistics.assists, 1)
+        self.assertEqual(merged[0].statistics.rebounds, 1)
+        self.assertEqual(merged[0].statistics.steals, 1)
+        self.assertEqual(merged[0].statistics.blocks, 0)
+        self.assertIn("review contact sheet confirmed same player", merged[0].merge_evidence)
 
     def test_adjacent_segment_identity_stitch_assigns_global_ids(self):
         service = self.make_service()

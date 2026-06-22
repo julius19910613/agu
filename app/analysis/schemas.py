@@ -114,6 +114,12 @@ class LongVideoPlayerSummaryResponse(BaseModel):
     statistics: PlayerBoxScoreEstimateResponse = Field(default_factory=PlayerBoxScoreEstimateResponse)
 
 
+class MergedLongVideoPlayerSummaryResponse(LongVideoPlayerSummaryResponse):
+    merged_from_global_player_ids: List[str] = Field(default_factory=list)
+    merge_confidence: float = 1.0
+    merge_evidence: List[str] = Field(default_factory=list)
+
+
 class JerseyNumberCandidateResponse(BaseModel):
     number: Optional[str] = None
     confidence: float = 0.0
@@ -166,6 +172,14 @@ class IdentityDuplicateCandidateResponse(BaseModel):
     conflict_evidence: List[str] = Field(default_factory=list)
 
 
+class ConfirmedIdentityMergeResponse(BaseModel):
+    canonical_global_player_id: str
+    merged_global_player_ids: List[str] = Field(default_factory=list)
+    source: str = "manual_review"
+    confidence: float = 1.0
+    evidence: List[str] = Field(default_factory=list)
+
+
 class LongVideoAuditSummaryResponse(BaseModel):
     total_segments: int
     passed: int
@@ -185,6 +199,8 @@ class LongVideoAnalysisResponse(BaseModel):
     players: List[LongVideoPlayerSummaryResponse]
     event_candidates: List[EventCandidateResponse] = Field(default_factory=list)
     identity_duplicate_candidates: List[IdentityDuplicateCandidateResponse] = Field(default_factory=list)
+    confirmed_identity_merges: List[ConfirmedIdentityMergeResponse] = Field(default_factory=list)
+    merged_players: List[MergedLongVideoPlayerSummaryResponse] = Field(default_factory=list)
     audit_summary: LongVideoAuditSummaryResponse
 
 
@@ -226,6 +242,7 @@ class AnalysisRequest(BaseModel):
     identity_embedding_device: Optional[str] = Field(default=None, description="Optional identity embedding device: auto, cpu, cuda, mps, or mps_if_available.")
     jersey_number_vlm_enabled: Optional[bool] = Field(default=None, description="If True, ask the configured VLM to read jersey numbers from sampled player crops.")
     jersey_number_vlm_frames: Optional[int] = Field(default=None, description="Number of sampled player crops to send for jersey number VLM recognition.")
+    confirmed_identity_merges: List[ConfirmedIdentityMergeResponse] = Field(default_factory=list, description="Optional confirmed global-player merges used to produce merged long-video player statistics.")
     r2plus1d_device: Optional[str] = Field(default=None, description="Optional R(2+1)D device override: auto, cpu, cuda, mps, or mps_if_available.")
     low_confidence: Optional[float] = Field(default=None, description="Override default low_confidence threshold.")
     high_confidence: Optional[float] = Field(default=None, description="Override default high_confidence threshold.")

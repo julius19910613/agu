@@ -76,6 +76,7 @@ basketball video -> player tracks -> action clips -> structured JSON + optional 
   - `result.long_video.players[]` 提供 segment-local 球员动作汇总和 `appearance_continuity_stitch_v2` 的轻量 `global_player_id` 身份候选。
   - `result.long_video.identity_duplicate_candidates[]` 提供疑似重复 `global_player_id` 的合并审核候选，不自动改写统计。
   - duplicate candidate 会使用采样 frame-level bbox 判断同屏硬冲突和重复框重叠。
+  - 请求体可传 `confirmed_identity_merges[]`，确认后的聚合统计会输出到 `result.long_video.merged_players[]`，原始 `players[]` 不会被覆盖。
   - `result.long_video.event_candidates[]` 提供 `block_candidate`、`rebound_candidate`、`steal_candidate` 事件线索。
 - 推理加速：
   - `BASKETBALL_TRACKING_FPS=8.0` 对 YOLO 跟踪做低帧率采样。
@@ -351,6 +352,7 @@ segment_end_sec           可选，局部分析结束时间
 max_segments              可选，限制分段数量
 vlm_audit                 默认 true，对 segment contact sheet 做 VLM audit
 vlm_audit_frames          默认 6
+confirmed_identity_merges 可选，确认后的 global_player_id 合并列表，用于输出 merged_players
 vid_stride                可选，覆盖默认窗口步长
 low_confidence            可选，覆盖低置信度阈值
 high_confidence           可选，覆盖高置信度阈值
@@ -471,6 +473,7 @@ Current identity and statistics behavior:
 - `player_identity_features[]` exposes model/fallback appearance embeddings and continuity evidence.
 - `long_video.players[]` exposes lightweight `global_player_id` candidates.
 - `long_video.identity_duplicate_candidates[]` exposes review-only duplicate-ID merge candidates and does not rewrite statistics automatically.
+- `long_video.merged_players[]` exposes confirmed-merge statistics when `confirmed_identity_merges[]` is supplied in the request.
 - `statistics.points`, `assists`, `rebounds`, `blocks`, and `steals` are action-proxy estimates, not official box-score truth. Block, rebound, and steal evidence should be confirmed through event candidates, ball/rim/possession evidence, VLM, or human review.
 
 Setup:

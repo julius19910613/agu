@@ -20,9 +20,11 @@ from app.analysis.schemas import (
     AnalysisRecordResponse,
     AnalysisSummaryResponse,
     EventCandidateResponse,
+    ConfirmedIdentityMergeResponse,
     LongVideoAnalysisResponse,
     LongVideoAuditSummaryResponse,
     LongVideoPlayerSummaryResponse,
+    MergedLongVideoPlayerSummaryResponse,
     LongVideoSegmentResponse,
     IdentityDuplicateCandidateResponse,
     PlayerIdentityFeatureResponse,
@@ -541,6 +543,10 @@ class AnalysisService:
             player_summaries,
             player_identity_features,
         )
+        merged_player_summaries = self._build_confirmed_merged_player_summaries(
+            player_summaries=player_summaries,
+            confirmed_merges=request.confirmed_identity_merges,
+        )
         merged_records = [
             record.model_copy(
                 update={
@@ -591,6 +597,8 @@ class AnalysisService:
                 players=player_summaries,
                 event_candidates=event_candidates,
                 identity_duplicate_candidates=identity_duplicate_candidates,
+                confirmed_identity_merges=request.confirmed_identity_merges,
+                merged_players=merged_player_summaries,
                 audit_summary=audit_summary,
             ),
         )
@@ -617,6 +625,95 @@ class AnalysisService:
             if owned_start <= center <= owned_end:
                 owned.append(record)
         return owned
+
+    def _build_confirmed_merged_player_summaries(
+        self,
+        player_summaries: List[LongVideoPlayerSummaryResponse],
+        confirmed_merges: List[ConfirmedIdentityMergeResponse],
+    ) -> List[MergedLongVideoPlayerSummaryResponse]:
+        """Aggregate player summaries after externally confirmed identity merges."""
+        if not confirmed_merges:
+            return []
+
+        by_global_id = {
+            summary.global_player_id: summary
+            for summary in player_summaries
+            if summary.global_player_id
+        }
+        merged_summaries: List[MergedLongVideoPlayerSummaryResponse] = []
+
+        for merge in confirmed_merges:
+            canonical_id = merge.canonical_global_player_id
+            requested_ids = [canonical_id, *merge.merged_global_player_ids]
+            unique_requested_ids = list(dict.fromkeys(player_id for player_id in requested_ids if player_id))
+            matched = [
+                by_global_id[player_id]
+                for player_id in unique_requested_ids
+                if player_id in by_global_id
+            ]
+            if not matched:
+                continue
+
+            actions: Counter[str] = Counter()
+            segment_ids: set[int] = set()
+            total_clips = 0
+            total_reviews = 0
+            confidence_weighted_sum = 0.0
+            identity_evidence: List[str] = []
+
+            for summary in matched:
+                actions.update(summary.action_counts)
+                total_clips += int(summary.clip_count)
+                total_reviews += int(summary.needs_review_count)
+                confidence_weighted_sum += float(summary.average_confidence) * int(summary.clip_count)
+                segment_ids.update(self._segment_ids_from_player_id(summary.player_id))
+                identity_evidence.extend(summary.identity_evidence)
+
+            missing_ids = [
+                player_id
+                for player_id in unique_requested_ids
+                if player_id not in by_global_id
+            ]
+            merge_evidence = [
+                f"confirmed merge source={merge.source}",
+                *merge.evidence,
+                *identity_evidence[:8],
+            ]
+            if missing_ids:
+                merge_evidence.append(f"confirmed merge ids not present in this analysis: {', '.join(missing_ids)}")
+
+            average_confidence = confidence_weighted_sum / total_clips if total_clips else 0.0
+            merged_summaries.append(
+                MergedLongVideoPlayerSummaryResponse(
+                    player_id=f"merged:{canonical_id}",
+                    global_player_id=canonical_id,
+                    identity_confidence=float(merge.confidence),
+                    identity_method="confirmed_identity_merge_v1",
+                    identity_evidence=merge_evidence,
+                    segments_seen=len(segment_ids) if segment_ids else sum(summary.segments_seen for summary in matched),
+                    clip_count=total_clips,
+                    action_counts=dict(actions),
+                    needs_review_count=total_reviews,
+                    average_confidence=average_confidence,
+                    statistics=self._estimate_player_statistics(actions),
+                    merged_from_global_player_ids=unique_requested_ids,
+                    merge_confidence=float(merge.confidence),
+                    merge_evidence=merge_evidence,
+                )
+            )
+
+        return merged_summaries
+
+    def _segment_ids_from_player_id(self, player_id: str) -> List[int]:
+        """Extract segment ids from canonical local ids such as segment_2:player_6."""
+        prefix = "segment_"
+        if not player_id.startswith(prefix):
+            return []
+        segment_part = player_id[len(prefix):].split(":", 1)[0]
+        try:
+            return [int(segment_part)]
+        except ValueError:
+            return []
 
     def _read_video_metadata(self, video_path: str) -> Dict[str, float]:
         cap = cv2.VideoCapture(video_path)

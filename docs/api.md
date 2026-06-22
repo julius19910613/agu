@@ -203,6 +203,7 @@ Important request fields:
 | `identity_embedding_device` | string or null | Optional identity embedding device: `auto`, `cpu`, `cuda`, `mps`, or `mps_if_available` |
 | `jersey_number_vlm_enabled` | boolean or null | Enables optional VLM jersey-number reading from sampled player crops |
 | `jersey_number_vlm_frames` | integer or null | Number of player crops sent to VLM for jersey-number reading |
+| `confirmed_identity_merges` | array | Optional confirmed global-player merge instructions used to emit `long_video.merged_players[]` |
 | `r2plus1d_device` | string or null | Optional R(2+1)D device override: `auto`, `cpu`, `cuda`, `mps`, or `mps_if_available` |
 
 `result.long_video.segments[]` contains segment-level summary and VLM audit status:
@@ -247,6 +248,22 @@ statistics automatically; they expose evidence for VLM or human confirmation.
 | `left_local_player_ids` / `right_local_player_ids` | array | Segment-local tracks behind each global ID |
 | `evidence` | array | Positive duplicate evidence |
 | `conflict_evidence` | array | Hard or soft conflict evidence |
+
+`result.long_video.confirmed_identity_merges[]` echoes confirmed merge
+instructions supplied in the request. `result.long_video.merged_players[]`
+contains the aggregate player summaries produced from those confirmed merges.
+This is a separate audit-safe view: original `players[]` and `records[]` remain
+unchanged.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `player_id` | string | Synthetic merged player key, for example `merged:player_004` |
+| `global_player_id` | string | Canonical confirmed global player ID |
+| `merged_from_global_player_ids` | array | Canonical plus merged global IDs included in the aggregate |
+| `merge_confidence` | number | Confidence supplied by the confirmed merge source |
+| `merge_evidence` | array | Confirmation and identity evidence retained for audit |
+| `action_counts` | object | Aggregated final action histogram |
+| `statistics` | object | Aggregated estimated points, assists, rebounds, blocks, and steals |
 
 `statistics` is an action-proxy estimate, not official box-score truth. In the
 current model, points are estimated from `shoot` actions and assists from `pass`
