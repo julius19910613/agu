@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Sequence
 
 import cv2
@@ -106,6 +107,66 @@ class TorchvisionMobileNetV3SmallEmbedder(BaseIdentityEmbedder):
         return (tensor - mean) / std
 
 
+class TorchreidOSNetEmbedder(BaseIdentityEmbedder):
+    method = "torchreid_osnet_embedding_v1"
+
+    def __init__(self, model_name: str, weights_name: str, device_name: str, batch_size: int = 16):
+        import torchreid
+
+        normalized_model = (model_name or "osnet_x0_25").lower()
+        normalized_weights = (weights_name or "default").lower()
+        pretrained = normalized_weights in {"default", "imagenet", "imagenet1k", "market1501", "pretrained"}
+        weight_label = "pretrained" if pretrained else normalized_weights.replace("/", "_").replace(".", "_")
+
+        self.model_id = f"torchreid_{normalized_model}_{weight_label}_embedding_v1"
+        self.device = _resolve_torch_device(device_name)
+        self.batch_size = max(1, int(batch_size or 16))
+        self.output_dim = 512
+        model = torchreid.models.build_model(
+            name=normalized_model,
+            num_classes=1000,
+            pretrained=pretrained,
+        )
+        if normalized_weights not in {"default", "imagenet", "imagenet1k", "market1501", "pretrained", "none", "random", "untrained"}:
+            weights_path = Path(weights_name).expanduser()
+            if not weights_path.exists():
+                raise FileNotFoundError(f"torchreid OSNet weights not found: {weights_name}")
+            torchreid.utils.load_pretrained_weights(model, str(weights_path))
+
+        self.model = model.to(self.device)
+        self.model.eval()
+
+    def embed_crops(self, crops_bgr: Sequence[np.ndarray]) -> IdentityEmbeddingResult:
+        tensors = [self._preprocess(crop) for crop in crops_bgr if crop is not None and crop.size > 0]
+        if not tensors:
+            embedding = np.zeros((self.output_dim,), dtype=np.float32)
+            return IdentityEmbeddingResult(embedding=embedding, model_id=self.model_id, method=self.method)
+
+        outputs: List[np.ndarray] = []
+        with torch.inference_mode():
+            for start in range(0, len(tensors), self.batch_size):
+                batch = torch.stack(tensors[start : start + self.batch_size], dim=0).to(self.device)
+                features = self.model(batch)
+                if isinstance(features, (list, tuple)):
+                    features = features[0]
+                features = torch.flatten(features, start_dim=1)
+                features = torch.nn.functional.normalize(features, p=2, dim=1)
+                outputs.append(features.detach().cpu().numpy().astype(np.float32))
+
+        embedding = np.concatenate(outputs, axis=0).mean(axis=0).astype(np.float32)
+        embedding = _l2_normalize(embedding)
+        self.output_dim = int(embedding.shape[0])
+        return IdentityEmbeddingResult(embedding=embedding, model_id=self.model_id, method=self.method)
+
+    def _preprocess(self, crop_bgr: np.ndarray) -> torch.Tensor:
+        resized = cv2.resize(crop_bgr, (128, 256), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        tensor = torch.from_numpy(rgb).permute(2, 0, 1)
+        mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+        return (tensor - mean) / std
+
+
 def build_identity_embedder(
     backend: str,
     weights: str = "default",
@@ -127,6 +188,19 @@ def build_identity_embedder(
             if not allow_fallback:
                 raise
             LOGGER.warning("Falling back to sidecar identity embedding after backend load failed: %s", exc)
+            return SidecarHsvHistogramEmbedder()
+    if normalized_backend in {"torchreid_osnet_x0_25", "osnet_x0_25", "torchreid:osnet_x0_25"}:
+        try:
+            return TorchreidOSNetEmbedder(
+                model_name="osnet_x0_25",
+                weights_name=weights,
+                device_name=device,
+                batch_size=batch_size,
+            )
+        except Exception as exc:
+            if not allow_fallback:
+                raise
+            LOGGER.warning("Falling back to sidecar identity embedding after torchreid OSNet load failed: %s", exc)
             return SidecarHsvHistogramEmbedder()
     raise ValueError(f"Unsupported identity embedding backend: {backend}")
 

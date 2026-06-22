@@ -1,10 +1,11 @@
 import unittest
 from collections import Counter
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import numpy as np
 
 import torch
 
+from app.analysis.identity_embedding import SidecarHsvHistogramEmbedder, build_identity_embedder
 from app.analysis.schemas import (
     AnalysisRecordResponse,
     AnalysisRequest,
@@ -386,6 +387,26 @@ class HybridAnalysisTest(unittest.TestCase):
         self.assertEqual(features[0].embedding_model, "torchvision_mobilenet_v3_small_none_embedding_v1")
         self.assertEqual(features[0].embedding_dim, 576)
         self.assertEqual(len(features[0].appearance_embedding), 576)
+
+    def test_torchreid_osnet_backend_falls_back_when_optional_dependency_is_missing(self):
+        with patch.dict("sys.modules", {"torchreid": None}):
+            embedder = build_identity_embedder(
+                backend="torchreid_osnet_x0_25",
+                weights="none",
+                device="cpu",
+                allow_fallback=True,
+            )
+        self.assertIsInstance(embedder, SidecarHsvHistogramEmbedder)
+
+    def test_torchreid_osnet_backend_raises_when_fallback_is_disabled(self):
+        with patch.dict("sys.modules", {"torchreid": None}):
+            with self.assertRaises(ImportError):
+                build_identity_embedder(
+                    backend="torchreid_osnet_x0_25",
+                    weights="none",
+                    device="cpu",
+                    allow_fallback=False,
+                )
 
     def test_identity_feature_extraction_can_attach_jersey_number_candidates(self):
         class FakeJerseyVerifier:

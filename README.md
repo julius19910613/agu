@@ -63,6 +63,7 @@ basketball video -> player tracks -> action clips -> structured JSON + optional 
   - OpenCV legacy trackers：`CSRT`、`MOSSE`、`KCF` 等。
 - 球员身份 embedding：
   - 默认使用 `torchvision_mobilenet_v3_small` 生成 576 维 appearance embedding。
+  - 可选 `BASKETBALL_IDENTITY_EMBEDDING_BACKEND=torchreid_osnet_x0_25` 接入本地 `torchreid` OSNet ReID 后端。
   - `sidecar_hsv_hist` 仅作为轻量 fallback/测试后端保留。
 - 模型推理：
   - 从 checkpoint 加载 `R(2+1)D-18`。
