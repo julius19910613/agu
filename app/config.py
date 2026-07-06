@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     max_vlm_clips: int = 8
     jersey_number_vlm_enabled: bool = False
     jersey_number_vlm_frames: int = 2
+    vlm_identity_merge_enabled: bool = False
+    vlm_identity_merge_max_candidates: int = 8
+    vlm_identity_merge_confidence: float = 0.78
+    vlm_identity_merge_crops_per_side: int = 3
 
     # --- Confidence thresholds ---
     low_confidence: float = 0.45

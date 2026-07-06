@@ -30,6 +30,7 @@ from app.analysis.schemas import (
     PlayerIdentityFeatureResponse,
     PlayerBoxScoreEstimateResponse,
     Size2D,
+    VLMIdentityMergeDecisionResponse,
     VLMVideoAuditResponse,
 )
 from app.analysis.tracking import extract_tracked_frames, crop_windows
@@ -543,9 +544,19 @@ class AnalysisService:
             player_summaries,
             player_identity_features,
         )
+        vlm_identity_merges, identity_merge_decisions = self._run_vlm_identity_merge_postprocess(
+            request=request,
+            video_path=request.video_path,
+            identity_duplicate_candidates=identity_duplicate_candidates,
+            player_identity_features=player_identity_features,
+        )
+        confirmed_identity_merges = [
+            *request.confirmed_identity_merges,
+            *vlm_identity_merges,
+        ]
         merged_player_summaries = self._build_confirmed_merged_player_summaries(
             player_summaries=player_summaries,
-            confirmed_merges=request.confirmed_identity_merges,
+            confirmed_merges=confirmed_identity_merges,
         )
         merged_records = [
             record.model_copy(
@@ -597,7 +608,8 @@ class AnalysisService:
                 players=player_summaries,
                 event_candidates=event_candidates,
                 identity_duplicate_candidates=identity_duplicate_candidates,
-                confirmed_identity_merges=request.confirmed_identity_merges,
+                identity_merge_decisions=identity_merge_decisions,
+                confirmed_identity_merges=confirmed_identity_merges,
                 merged_players=merged_player_summaries,
                 audit_summary=audit_summary,
             ),
@@ -625,6 +637,218 @@ class AnalysisService:
             if owned_start <= center <= owned_end:
                 owned.append(record)
         return owned
+
+    def _run_vlm_identity_merge_postprocess(
+        self,
+        request: AnalysisRequest,
+        video_path: str,
+        identity_duplicate_candidates: List[IdentityDuplicateCandidateResponse],
+        player_identity_features: Dict[str, PlayerIdentityFeatureResponse],
+    ) -> tuple[List[ConfirmedIdentityMergeResponse], List[VLMIdentityMergeDecisionResponse]]:
+        enabled = (
+            request.vlm_identity_merge_enabled
+            if request.vlm_identity_merge_enabled is not None
+            else getattr(self.settings, "vlm_identity_merge_enabled", False)
+        )
+        if not enabled or not identity_duplicate_candidates:
+            return [], []
+
+        max_candidates = (
+            request.vlm_identity_merge_max_candidates
+            if request.vlm_identity_merge_max_candidates is not None
+            else getattr(self.settings, "vlm_identity_merge_max_candidates", 8)
+        )
+        confidence_threshold = (
+            request.vlm_identity_merge_confidence
+            if request.vlm_identity_merge_confidence is not None
+            else getattr(self.settings, "vlm_identity_merge_confidence", 0.78)
+        )
+        crops_per_side = int(getattr(self.settings, "vlm_identity_merge_crops_per_side", 3) or 3)
+        verifier = OllamaVLMVerifier(
+            model=self.settings.ollama_model,
+            host=self.settings.ollama_host,
+            timeout=self.settings.ollama_timeout,
+            image_width=max(512, int(self.settings.vlm_image_width)),
+        )
+
+        decisions: List[VLMIdentityMergeDecisionResponse] = []
+        confirmed_merges: List[ConfirmedIdentityMergeResponse] = []
+        for candidate in identity_duplicate_candidates[: max(0, int(max_candidates or 0))]:
+            frames = self._make_identity_merge_review_frames(
+                video_path=video_path,
+                candidate=candidate,
+                player_identity_features=player_identity_features,
+                crops_per_side=crops_per_side,
+            )
+            decision = verifier.confirm_identity_merge(frames, candidate)
+            decisions.append(decision)
+            confirmed_merge = self._confirmed_merge_from_vlm_decision(
+                candidate=candidate,
+                decision=decision,
+                confidence_threshold=float(confidence_threshold or 0.78),
+            )
+            if confirmed_merge is not None:
+                confirmed_merges.append(confirmed_merge)
+
+        return confirmed_merges, decisions
+
+    def _confirmed_merge_from_vlm_decision(
+        self,
+        candidate: IdentityDuplicateCandidateResponse,
+        decision: VLMIdentityMergeDecisionResponse,
+        confidence_threshold: float,
+    ) -> Optional[ConfirmedIdentityMergeResponse]:
+        if not decision.available or not decision.is_same_player:
+            return None
+        if float(decision.confidence) < float(confidence_threshold):
+            return None
+        canonical_id = decision.canonical_global_player_id or candidate.left_global_player_id
+        if canonical_id not in {candidate.left_global_player_id, candidate.right_global_player_id}:
+            canonical_id = candidate.left_global_player_id
+        merged_ids = [
+            player_id
+            for player_id in (decision.merged_global_player_ids or [])
+            if player_id in {candidate.left_global_player_id, candidate.right_global_player_id}
+            and player_id != canonical_id
+        ]
+        if not merged_ids:
+            merged_ids = [
+                candidate.right_global_player_id
+                if canonical_id == candidate.left_global_player_id
+                else candidate.left_global_player_id
+            ]
+        return ConfirmedIdentityMergeResponse(
+            canonical_global_player_id=canonical_id,
+            merged_global_player_ids=list(dict.fromkeys(merged_ids)),
+            source="vlm_identity_merge_v1",
+            confidence=float(decision.confidence),
+            evidence=[
+                f"VLM identity merge confirmed: {decision.reason}",
+                *decision.evidence,
+                *candidate.evidence[:6],
+            ],
+        )
+
+    def _make_identity_merge_review_frames(
+        self,
+        video_path: str,
+        candidate: IdentityDuplicateCandidateResponse,
+        player_identity_features: Dict[str, PlayerIdentityFeatureResponse],
+        crops_per_side: int,
+    ) -> List[np.ndarray]:
+        left_crops = self._extract_identity_review_crops(
+            video_path,
+            candidate.left_local_player_ids,
+            player_identity_features,
+            label=f"LEFT {candidate.left_global_player_id}",
+            max_crops=crops_per_side,
+        )
+        right_crops = self._extract_identity_review_crops(
+            video_path,
+            candidate.right_local_player_ids,
+            player_identity_features,
+            label=f"RIGHT {candidate.right_global_player_id}",
+            max_crops=crops_per_side,
+        )
+        crops = left_crops + right_crops
+        if not crops:
+            return []
+        return [self._make_labeled_contact_sheet(crops)]
+
+    def _extract_identity_review_crops(
+        self,
+        video_path: str,
+        local_player_ids: List[str],
+        player_identity_features: Dict[str, PlayerIdentityFeatureResponse],
+        label: str,
+        max_crops: int,
+    ) -> List[np.ndarray]:
+        cap = cv2.VideoCapture(video_path)
+        crops: List[np.ndarray] = []
+        try:
+            if not cap.isOpened():
+                return []
+            for local_player_id in local_player_ids:
+                feature = player_identity_features.get(local_player_id)
+                if feature is None:
+                    continue
+                boxes = sorted(
+                    feature.sampled_boxes,
+                    key=lambda box: float(box.get("w", 0.0)) * float(box.get("h", 0.0)),
+                    reverse=True,
+                )
+                for box in boxes[:2]:
+                    frame_index = self._sampled_box_absolute_frame(feature, box)
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, frame_index))
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        continue
+                    crop = self._crop_box_from_frame(frame, box)
+                    if crop is None:
+                        continue
+                    crops.append(self._label_review_crop(crop, f"{label} {local_player_id}"))
+                    if len(crops) >= max(1, int(max_crops or 1)):
+                        return crops
+        finally:
+            cap.release()
+        return crops
+
+    def _sampled_box_absolute_frame(
+        self,
+        feature: PlayerIdentityFeatureResponse,
+        box: Dict[str, float],
+    ) -> int:
+        frame_value = float(box.get("frame", 0.0))
+        start_frame = float(feature.start_frame or 0)
+        if start_frame > 0 and frame_value < start_frame:
+            frame_value += start_frame
+        return int(round(frame_value))
+
+    def _crop_box_from_frame(
+        self,
+        frame: np.ndarray,
+        box: Dict[str, float],
+    ) -> Optional[np.ndarray]:
+        height, width = frame.shape[:2]
+        x = float(box.get("x", 0.0))
+        y = float(box.get("y", 0.0))
+        w = float(box.get("w", 0.0))
+        h = float(box.get("h", 0.0))
+        if w <= 1.0 or h <= 1.0:
+            return None
+        padding = 0.08
+        x1 = max(0, min(width - 1, int(round(x - w * padding))))
+        y1 = max(0, min(height - 1, int(round(y - h * padding))))
+        x2 = max(x1 + 1, min(width, int(round(x + w * (1.0 + padding)))))
+        y2 = max(y1 + 1, min(height, int(round(y + h * (1.0 + padding)))))
+        crop = frame[y1:y2, x1:x2]
+        return crop if crop.size > 0 else None
+
+    def _label_review_crop(self, crop: np.ndarray, label: str) -> np.ndarray:
+        tile = cv2.resize(crop, (160, 240), interpolation=cv2.INTER_AREA)
+        cv2.rectangle(tile, (0, 0), (159, 24), (0, 0, 0), thickness=-1)
+        cv2.putText(
+            tile,
+            label[:28],
+            (5, 17),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        return tile
+
+    def _make_labeled_contact_sheet(self, crops: List[np.ndarray]) -> np.ndarray:
+        columns = min(3, max(1, len(crops)))
+        rows = (len(crops) + columns - 1) // columns
+        tile_h, tile_w = crops[0].shape[:2]
+        sheet = np.full((rows * tile_h, columns * tile_w, 3), 245, dtype=np.uint8)
+        for index, crop in enumerate(crops):
+            row = index // columns
+            col = index % columns
+            sheet[row * tile_h : (row + 1) * tile_h, col * tile_w : (col + 1) * tile_w] = crop
+        return sheet
 
     def _build_confirmed_merged_player_summaries(
         self,

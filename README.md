@@ -78,6 +78,7 @@ basketball video -> player tracks -> action clips -> structured JSON + optional 
   - `result.long_video.identity_duplicate_candidates[]` 提供疑似重复 `global_player_id` 的合并审核候选，不自动改写统计。
   - duplicate candidate 会使用采样 frame-level bbox 判断同屏硬冲突和重复框重叠。
   - 请求体可传 `confirmed_identity_merges[]`，确认后的聚合统计会输出到 `result.long_video.merged_players[]`，原始 `players[]` 不会被覆盖。
+  - 可选 `vlm_identity_merge_enabled=true` 后，VLM 会审核 duplicate candidates，并把高置信 same-player 决策转为 `confirmed_identity_merges[]`。
   - `result.long_video.event_candidates[]` 提供 `block_candidate`、`rebound_candidate`、`steal_candidate` 事件线索。
 - 推理加速：
   - `BASKETBALL_TRACKING_FPS=8.0` 对 YOLO 跟踪做低帧率采样。
@@ -354,6 +355,9 @@ max_segments              可选，限制分段数量
 vlm_audit                 默认 true，对 segment contact sheet 做 VLM audit
 vlm_audit_frames          默认 6
 confirmed_identity_merges 可选，确认后的 global_player_id 合并列表，用于输出 merged_players
+vlm_identity_merge_enabled 可选，使用 VLM 审核 duplicate candidates 并自动生成 confirmed merge
+vlm_identity_merge_max_candidates 可选，限制发送给 VLM 的候选数量
+vlm_identity_merge_confidence 可选，VLM 合并确认阈值
 vid_stride                可选，覆盖默认窗口步长
 low_confidence            可选，覆盖低置信度阈值
 high_confidence           可选，覆盖高置信度阈值
@@ -413,7 +417,31 @@ high_confidence           可选，覆盖高置信度阈值
   --output-json analysis_outputs/perf_runs/identity-duplicate-report.json \
   --screenshot-dir analysis_outputs/player_stat_screenshots_20260622 \
   --contact-sheet analysis_outputs/perf_runs/identity-duplicate-review.jpg
+./venv/bin/python scripts/build_player_markdown_reports.py \
+  --analysis-json analysis_outputs/perf_runs/mov-full-current-20260622-224247.json \
+  --video-path path/to/video.mov \
+  --output-dir analysis_outputs/player_markdown_reports
 ```
+
+如需让 VLM 对绿色框选目标做二次复核，并过滤明确不是球员的结果：
+
+```bash
+./venv/bin/python scripts/build_player_markdown_reports.py \
+  --analysis-json analysis_outputs/perf_runs/mov-full-current-20260622-224247.json \
+  --video-path path/to/video.mov \
+  --output-dir analysis_outputs/player_markdown_reports_vlm_filtered \
+  --max-players 18 \
+  --dedupe-players \
+  --vlm-player-filter \
+  --require-vlm-player \
+  --vlm-model qwen3-vl:4b \
+  --vlm-concurrency 2 \
+  --vlm-timeout-sec 45 \
+  --vlm-cache-path analysis_outputs/player_markdown_reports_vlm_cache.json \
+  --vlm-progress
+```
+
+全量常态使用建议复用同一个 `--vlm-cache-path`。脚本会在每个 player 的 VLM 判断完成后立即写入缓存；如果中途停止，下一次重跑会跳过已验证过的框选截图。报告截图面向人工审阅时，建议同时使用 `--dedupe-players --max-players 18 --require-vlm-player`，避免把重复身份或明确非球员框写成独立球员报告。
 
 ### Legacy 入口状态
 
@@ -474,6 +502,7 @@ Current identity and statistics behavior:
 - `player_identity_features[]` exposes model/fallback appearance embeddings and continuity evidence.
 - `long_video.players[]` exposes lightweight `global_player_id` candidates.
 - `long_video.identity_duplicate_candidates[]` exposes review-only duplicate-ID merge candidates and does not rewrite statistics automatically.
+- `long_video.identity_merge_decisions[]` exposes optional VLM post-processing decisions when `vlm_identity_merge_enabled=true`.
 - `long_video.merged_players[]` exposes confirmed-merge statistics when `confirmed_identity_merges[]` is supplied in the request.
 - `statistics.points`, `assists`, `rebounds`, `blocks`, and `steals` are action-proxy estimates, not official box-score truth. Block, rebound, and steal evidence should be confirmed through event candidates, ball/rim/possession evidence, VLM, or human review.
 

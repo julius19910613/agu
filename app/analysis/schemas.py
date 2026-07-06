@@ -180,6 +180,20 @@ class ConfirmedIdentityMergeResponse(BaseModel):
     evidence: List[str] = Field(default_factory=list)
 
 
+class VLMIdentityMergeDecisionResponse(BaseModel):
+    left_global_player_id: str
+    right_global_player_id: str
+    is_same_player: bool = False
+    confidence: float = 0.0
+    canonical_global_player_id: Optional[str] = None
+    merged_global_player_ids: List[str] = Field(default_factory=list)
+    reason: str = ""
+    evidence: List[str] = Field(default_factory=list)
+    raw_response: str = ""
+    available: bool = False
+    source: str = "vlm_identity_merge_v1"
+
+
 class LongVideoAuditSummaryResponse(BaseModel):
     total_segments: int
     passed: int
@@ -199,6 +213,7 @@ class LongVideoAnalysisResponse(BaseModel):
     players: List[LongVideoPlayerSummaryResponse]
     event_candidates: List[EventCandidateResponse] = Field(default_factory=list)
     identity_duplicate_candidates: List[IdentityDuplicateCandidateResponse] = Field(default_factory=list)
+    identity_merge_decisions: List[VLMIdentityMergeDecisionResponse] = Field(default_factory=list)
     confirmed_identity_merges: List[ConfirmedIdentityMergeResponse] = Field(default_factory=list)
     merged_players: List[MergedLongVideoPlayerSummaryResponse] = Field(default_factory=list)
     audit_summary: LongVideoAuditSummaryResponse
@@ -243,6 +258,9 @@ class AnalysisRequest(BaseModel):
     jersey_number_vlm_enabled: Optional[bool] = Field(default=None, description="If True, ask the configured VLM to read jersey numbers from sampled player crops.")
     jersey_number_vlm_frames: Optional[int] = Field(default=None, description="Number of sampled player crops to send for jersey number VLM recognition.")
     confirmed_identity_merges: List[ConfirmedIdentityMergeResponse] = Field(default_factory=list, description="Optional confirmed global-player merges used to produce merged long-video player statistics.")
+    vlm_identity_merge_enabled: Optional[bool] = Field(default=None, description="If True, use VLM to review duplicate global-player candidates and emit confirmed merges.")
+    vlm_identity_merge_max_candidates: Optional[int] = Field(default=None, description="Maximum duplicate identity candidates sent to VLM for merge review.")
+    vlm_identity_merge_confidence: Optional[float] = Field(default=None, description="Minimum VLM confidence required to convert a merge decision into a confirmed merge.")
     r2plus1d_device: Optional[str] = Field(default=None, description="Optional R(2+1)D device override: auto, cpu, cuda, mps, or mps_if_available.")
     low_confidence: Optional[float] = Field(default=None, description="Override default low_confidence threshold.")
     high_confidence: Optional[float] = Field(default=None, description="Override default high_confidence threshold.")

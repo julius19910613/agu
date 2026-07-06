@@ -205,6 +205,9 @@ Important request fields:
 | `jersey_number_vlm_enabled` | boolean or null | Enables optional VLM jersey-number reading from sampled player crops |
 | `jersey_number_vlm_frames` | integer or null | Number of player crops sent to VLM for jersey-number reading |
 | `confirmed_identity_merges` | array | Optional confirmed global-player merge instructions used to emit `long_video.merged_players[]` |
+| `vlm_identity_merge_enabled` | boolean or null | Enables optional VLM post-processing over duplicate identity candidates |
+| `vlm_identity_merge_max_candidates` | integer or null | Maximum duplicate candidates sent to VLM for merge review |
+| `vlm_identity_merge_confidence` | number or null | Minimum VLM same-player confidence required to emit a confirmed merge |
 | `r2plus1d_device` | string or null | Optional R(2+1)D device override: `auto`, `cpu`, `cuda`, `mps`, or `mps_if_available` |
 
 `result.long_video.segments[]` contains segment-level summary and VLM audit status:
@@ -255,6 +258,24 @@ instructions supplied in the request. `result.long_video.merged_players[]`
 contains the aggregate player summaries produced from those confirmed merges.
 This is a separate audit-safe view: original `players[]` and `records[]` remain
 unchanged.
+
+When `vlm_identity_merge_enabled=true`, AGU sends the top
+`identity_duplicate_candidates[]` to the configured VLM using labeled LEFT/RIGHT
+player crop contact sheets. Each VLM response is recorded in
+`result.long_video.identity_merge_decisions[]`. Only available decisions with
+`is_same_player=true` and confidence above `vlm_identity_merge_confidence` are
+converted into additional `confirmed_identity_merges[]`.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `left_global_player_id` / `right_global_player_id` | string | Reviewed duplicate candidate pair |
+| `is_same_player` | boolean | VLM same-player decision |
+| `confidence` | number | VLM confidence for the decision |
+| `canonical_global_player_id` | string or null | Canonical ID chosen by VLM, constrained to the reviewed pair |
+| `merged_global_player_ids` | array | IDs to merge into the canonical ID |
+| `reason` | string | VLM rationale |
+| `evidence` | array | VLM visual evidence |
+| `available` | boolean | Whether VLM returned a usable decision |
 
 | Field | Type | Meaning |
 | --- | --- | --- |

@@ -12,10 +12,12 @@ import numpy as np
 
 from app.analysis.inference import LABEL_TO_ID, LABELS
 from app.analysis.schemas import (
+    IdentityDuplicateCandidateResponse,
     JerseyNumberCandidateResponse,
     ModelPrediction,
     MotionFeatures,
     VLMDecisionResponse,
+    VLMIdentityMergeDecisionResponse,
     VLMVideoAuditResponse,
 )
 
@@ -363,6 +365,98 @@ class OllamaVLMVerifier:
             )
         ]
 
+    def confirm_identity_merge(
+        self,
+        frames: Sequence[np.ndarray],
+        candidate: IdentityDuplicateCandidateResponse,
+    ) -> VLMIdentityMergeDecisionResponse:
+        """Ask the VLM whether two global player IDs appear to be the same person."""
+        images = encode_frames_jpeg(frames, max_width=max(512, self.image_width))
+        if not images:
+            return VLMIdentityMergeDecisionResponse(
+                left_global_player_id=candidate.left_global_player_id,
+                right_global_player_id=candidate.right_global_player_id,
+                reason="No review frames were available for VLM identity merge confirmation.",
+                available=False,
+            )
+
+        payload = {
+            "model": self.model,
+            "stream": False,
+            "prompt": self._build_identity_merge_prompt(candidate),
+            "images": images,
+            "format": "json",
+            "options": {"temperature": 0.0, "num_predict": 260},
+        }
+        request = urllib.request.Request(
+            f"{self.host}/api/generate",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            return VLMIdentityMergeDecisionResponse(
+                left_global_player_id=candidate.left_global_player_id,
+                right_global_player_id=candidate.right_global_player_id,
+                reason=f"Ollama VLM HTTP error {exc.code}: {detail}",
+                raw_response=detail,
+                available=False,
+            )
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            return VLMIdentityMergeDecisionResponse(
+                left_global_player_id=candidate.left_global_player_id,
+                right_global_player_id=candidate.right_global_player_id,
+                reason=f"Ollama VLM unavailable: {exc}",
+                available=False,
+            )
+
+        raw = json.dumps(body)
+        try:
+            parsed, raw = parse_vlm_payload(body)
+        except (ValueError, json.JSONDecodeError) as exc:
+            return VLMIdentityMergeDecisionResponse(
+                left_global_player_id=candidate.left_global_player_id,
+                right_global_player_id=candidate.right_global_player_id,
+                reason=f"VLM returned non-JSON identity merge response: {exc}",
+                raw_response=raw,
+                available=True,
+            )
+
+        canonical = str(parsed.get("canonical_global_player_id") or "").strip() or None
+        if canonical not in {candidate.left_global_player_id, candidate.right_global_player_id}:
+            canonical = candidate.left_global_player_id
+        merged_ids = _string_list(parsed.get("merged_global_player_ids"))
+        if not merged_ids:
+            merged_ids = [
+                candidate.right_global_player_id
+                if canonical == candidate.left_global_player_id
+                else candidate.left_global_player_id
+            ]
+        merged_ids = [
+            player_id
+            for player_id in dict.fromkeys(merged_ids)
+            if player_id in {candidate.left_global_player_id, candidate.right_global_player_id}
+            and player_id != canonical
+        ]
+
+        return VLMIdentityMergeDecisionResponse(
+            left_global_player_id=candidate.left_global_player_id,
+            right_global_player_id=candidate.right_global_player_id,
+            is_same_player=bool(parse_optional_bool(parsed.get("is_same_player"))),
+            confidence=clamp_float(parsed.get("confidence"), 0.0, 1.0, default=0.0),
+            canonical_global_player_id=canonical,
+            merged_global_player_ids=merged_ids,
+            reason=str(parsed.get("reason", "")),
+            evidence=_string_list(parsed.get("evidence")),
+            raw_response=raw,
+            available=True,
+        )
+
     def _build_prompt(self, prediction: ModelPrediction, motion: MotionFeatures) -> str:
         labels = ", ".join(LABELS.values())
         return (
@@ -399,6 +493,24 @@ class OllamaVLMVerifier:
             "If no jersey number is visible, return number as null, confidence 0, visible false. "
             "Be conservative: do not guess when the crop is blurry, occluded, or only shows a face. "
             f"Scope: {scope}."
+        )
+
+    def _build_identity_merge_prompt(self, candidate: IdentityDuplicateCandidateResponse) -> str:
+        return (
+            "You are reviewing a basketball player identity merge candidate. "
+            "The image is a contact sheet: crops labeled LEFT belong to one global_player_id, "
+            "and crops labeled RIGHT belong to another global_player_id. "
+            "Decide whether LEFT and RIGHT are the same real player across time. "
+            "Use visual evidence such as jersey number, jersey color, body shape, shoes, "
+            "pose continuity, and whether crops look like duplicate detections. "
+            "Be conservative: if uncertain, return is_same_player false or low confidence. "
+            "Return only compact JSON with keys: is_same_player, confidence, "
+            "canonical_global_player_id, merged_global_player_ids, reason, evidence. "
+            f"LEFT global_player_id: {candidate.left_global_player_id}. "
+            f"RIGHT global_player_id: {candidate.right_global_player_id}. "
+            f"Algorithmic candidate confidence: {candidate.confidence:.3f}. "
+            f"Algorithmic evidence: {'; '.join(candidate.evidence[:6])}. "
+            f"Conflict evidence: {'; '.join(candidate.conflict_evidence[:4])}."
         )
 
 

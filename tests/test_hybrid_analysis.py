@@ -1,6 +1,9 @@
 import unittest
+import tempfile
 from collections import Counter
+from pathlib import Path
 from unittest.mock import MagicMock, patch
+import cv2
 import numpy as np
 
 import torch
@@ -11,12 +14,14 @@ from app.analysis.schemas import (
     AnalysisRequest,
     ConfirmedIdentityMergeResponse,
     FinalDecisionResponse,
+    IdentityDuplicateCandidateResponse,
     JerseyNumberCandidateResponse,
     LongVideoPlayerSummaryResponse,
     ModelPrediction,
     MotionFeatures,
     PlayerIdentityFeatureResponse,
     VLMDecisionResponse,
+    VLMIdentityMergeDecisionResponse,
 )
 from app.analysis.service import AnalysisService
 from app.analysis.vlm import extract_json_object, normalize_action
@@ -61,6 +66,10 @@ class HybridAnalysisTest(unittest.TestCase):
         settings.identity_embedding_allow_fallback = True
         settings.jersey_number_vlm_enabled = False
         settings.jersey_number_vlm_frames = 2
+        settings.vlm_identity_merge_enabled = False
+        settings.vlm_identity_merge_max_candidates = 8
+        settings.vlm_identity_merge_confidence = 0.78
+        settings.vlm_identity_merge_crops_per_side = 3
         return AnalysisService(settings=settings, model=MagicMock(), device=torch.device("cpu"))
 
     def make_record(self, player, action, start_frame, end_frame, segment_id=0, confidence=0.7):
@@ -172,6 +181,9 @@ class HybridAnalysisTest(unittest.TestCase):
                     evidence=["same jersey number and appearance"],
                 )
             ],
+            vlm_identity_merge_enabled=True,
+            vlm_identity_merge_max_candidates=4,
+            vlm_identity_merge_confidence=0.82,
             r2plus1d_device="mps_if_available",
         )
         self.assertEqual(request.action_vid_stride, 24)
@@ -190,6 +202,9 @@ class HybridAnalysisTest(unittest.TestCase):
         self.assertEqual(request.jersey_number_vlm_frames, 2)
         self.assertEqual(request.confirmed_identity_merges[0].canonical_global_player_id, "player_004")
         self.assertEqual(request.confirmed_identity_merges[0].merged_global_player_ids, ["player_006"])
+        self.assertTrue(request.vlm_identity_merge_enabled)
+        self.assertEqual(request.vlm_identity_merge_max_candidates, 4)
+        self.assertEqual(request.vlm_identity_merge_confidence, 0.82)
         self.assertEqual(request.r2plus1d_device, "mps_if_available")
 
     def test_yolo_tracker_adapter_config_resolution(self):
@@ -282,6 +297,114 @@ class HybridAnalysisTest(unittest.TestCase):
         self.assertEqual(merged[0].statistics.steals, 1)
         self.assertEqual(merged[0].statistics.blocks, 0)
         self.assertIn("review contact sheet confirmed same player", merged[0].merge_evidence)
+
+    def test_vlm_identity_merge_decision_can_confirm_candidate(self):
+        service = self.make_service()
+        candidate = IdentityDuplicateCandidateResponse(
+            left_global_player_id="player_004",
+            right_global_player_id="player_006",
+            confidence=0.86,
+            left_local_player_ids=["segment_0:player_4"],
+            right_local_player_ids=["segment_2:player_6"],
+            evidence=["appearance embedding similarity 0.91"],
+        )
+        decision = VLMIdentityMergeDecisionResponse(
+            left_global_player_id="player_004",
+            right_global_player_id="player_006",
+            is_same_player=True,
+            confidence=0.88,
+            canonical_global_player_id="player_004",
+            merged_global_player_ids=["player_006"],
+            reason="same jersey and body shape",
+            evidence=["same jersey number"],
+            available=True,
+        )
+        merge = service._confirmed_merge_from_vlm_decision(candidate, decision, confidence_threshold=0.78)
+        self.assertIsNotNone(merge)
+        self.assertEqual(merge.canonical_global_player_id, "player_004")
+        self.assertEqual(merge.merged_global_player_ids, ["player_006"])
+        self.assertEqual(merge.source, "vlm_identity_merge_v1")
+        self.assertEqual(merge.confidence, 0.88)
+
+    def test_vlm_identity_merge_decision_rejects_low_confidence_or_negative(self):
+        service = self.make_service()
+        candidate = IdentityDuplicateCandidateResponse(
+            left_global_player_id="player_004",
+            right_global_player_id="player_006",
+            confidence=0.86,
+        )
+        low_confidence = VLMIdentityMergeDecisionResponse(
+            left_global_player_id="player_004",
+            right_global_player_id="player_006",
+            is_same_player=True,
+            confidence=0.55,
+            available=True,
+        )
+        negative = VLMIdentityMergeDecisionResponse(
+            left_global_player_id="player_004",
+            right_global_player_id="player_006",
+            is_same_player=False,
+            confidence=0.95,
+            available=True,
+        )
+        self.assertIsNone(service._confirmed_merge_from_vlm_decision(candidate, low_confidence, 0.78))
+        self.assertIsNone(service._confirmed_merge_from_vlm_decision(candidate, negative, 0.78))
+
+    def test_identity_review_crops_use_absolute_sampled_box_frames(self):
+        service = self.make_service()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "sample.mp4"
+            writer = cv2.VideoWriter(
+                str(video_path),
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                2.0,
+                (40, 40),
+            )
+            for index in range(5):
+                frame = np.zeros((40, 40, 3), dtype=np.uint8)
+                if index == 2:
+                    frame[:, :] = (0, 255, 0)
+                elif index == 4:
+                    frame[:, :] = (0, 0, 255)
+                writer.write(frame)
+            writer.release()
+
+            features = {
+                "segment_1:player_2": PlayerIdentityFeatureResponse(
+                    player=2,
+                    segment_id=1,
+                    local_player_id="segment_1:player_2",
+                    start_frame=2,
+                    end_frame=4,
+                    sampled_boxes=[{"frame": 2, "x": 4, "y": 4, "w": 24, "h": 24}],
+                )
+            }
+            self.assertEqual(
+                service._sampled_box_absolute_frame(
+                    features["segment_1:player_2"],
+                    {"frame": 0, "x": 4, "y": 4, "w": 24, "h": 24},
+                ),
+                2,
+            )
+            self.assertEqual(
+                service._sampled_box_absolute_frame(
+                    features["segment_1:player_2"],
+                    {"frame": 2, "x": 4, "y": 4, "w": 24, "h": 24},
+                ),
+                2,
+            )
+
+            crops = service._extract_identity_review_crops(
+                str(video_path),
+                ["segment_1:player_2"],
+                features,
+                label="LEFT player_002",
+                max_crops=1,
+            )
+
+        self.assertEqual(len(crops), 1)
+        body = crops[0][32:, :, :]
+        self.assertGreater(float(body[:, :, 1].mean()), float(body[:, :, 2].mean()))
 
     def test_adjacent_segment_identity_stitch_assigns_global_ids(self):
         service = self.make_service()

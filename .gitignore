@@ -60,6 +60,7 @@ venv.bak/
 model_checkpoints/
 output_videos/
 analysis_outputs/
+analyze_result/
 scratch/
 examples/*.gif
 examples/*.mp4
