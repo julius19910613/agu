@@ -122,6 +122,12 @@ Response body:
 }
 ```
 
+For running tasks, `progress` is a best-effort integer from 0 to 100. AGU now
+updates it at major pipeline stages such as tracker setup, window cropping,
+R(2+1)D inference, fusion/VLM verification, identity extraction, segment audit,
+and post-processing. It is intended for CLI/UI polling feedback, not as a
+durable timing contract; completed and failed tasks still finish at `100`.
+
 ## Stable Output Fields
 
 `result.records[]` contains one row per player clip.

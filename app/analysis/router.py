@@ -29,7 +29,11 @@ def bg_run_analysis(
     """Run analysis in a background thread and update TaskManager states."""
     try:
         task_manager.update_status(task_id, status="processing", progress=10)
-        result = service.run_analysis(request)
+
+        def update_progress(progress: int) -> None:
+            task_manager.update_status(task_id, status="processing", progress=progress)
+
+        result = service.run_analysis(request, progress_callback=update_progress)
         task_manager.set_result(task_id, result)
     except Exception as e:
         err_msg = "".join(traceback.format_exception(None, e, e.__traceback__))

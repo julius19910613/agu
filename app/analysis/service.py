@@ -6,7 +6,7 @@ import os
 import tempfile
 import time
 from collections import Counter, defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 import cv2
@@ -46,6 +46,7 @@ from app.video.writer import write_annotated_video
 
 
 LOGGER = logging.getLogger(__name__)
+ProgressCallback = Callable[[int], None]
 
 
 class AnalysisService:
@@ -98,13 +99,26 @@ class AnalysisService:
         self.model.eval()
         return self.model
         
-    def run_analysis(self, request: AnalysisRequest) -> AnalysisResponse:
+    def run_analysis(
+        self,
+        request: AnalysisRequest,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> AnalysisResponse:
         """Run either the standard single-pass pipeline or long-video segmented pipeline."""
         if request.segmented_analysis or request.long_video_mode:
-            return self.run_long_video_analysis(request)
-        return self._run_single_analysis(request)
+            return self.run_long_video_analysis(request, progress_callback=progress_callback)
+        return self._run_single_analysis(request, progress_callback=progress_callback)
 
-    def _run_single_analysis(self, request: AnalysisRequest, persist_output: bool = True) -> AnalysisResponse:
+    def _emit_progress(self, progress_callback: Optional[ProgressCallback], progress: int) -> None:
+        if progress_callback is not None:
+            progress_callback(max(0, min(99, int(progress))))
+
+    def _run_single_analysis(
+        self,
+        request: AnalysisRequest,
+        persist_output: bool = True,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> AnalysisResponse:
         """Run the full hybrid analysis pipeline blockingly."""
         started_at = time.time()
         effective_vid_stride = request.vid_stride if request.vid_stride is not None else self.settings.vid_stride
@@ -141,6 +155,7 @@ class AnalysisService:
         )
         inference_device = self._resolve_r2plus1d_device(request)
         model = self._ensure_model_device(inference_device)
+        self._emit_progress(progress_callback, 12)
         
         # 1. Video Tracking
         self._log_progress(
@@ -170,6 +185,7 @@ class AnalysisService:
             yolo_imgsz=effective_yolo_imgsz,
             max_players=effective_max_players,
         )
+        self._emit_progress(progress_callback, 35)
 
         # 2. Window Cropping
         self._log_progress(
@@ -182,6 +198,7 @@ class AnalysisService:
             seq_length=self.settings.seq_length,
             vid_stride=effective_vid_stride,
         )
+        self._emit_progress(progress_callback, 45)
         
         # 3. Model Inference
         self._log_progress(f"Running R(2+1)D inference on {inference_device} with batch_size={self.settings.batch_size}.")
@@ -191,6 +208,7 @@ class AnalysisService:
             device=inference_device,
             batch_size=self.settings.batch_size,
         )
+        self._emit_progress(progress_callback, 65)
         
         # 4. VLM Initialization
         verifier: Optional[OllamaVLMVerifier] = None
@@ -214,6 +232,8 @@ class AnalysisService:
         output_records: List[Dict[str, Any]] = []
         final_prediction_ids: Dict[int, Dict[int, int]] = {}
         vlm_used_count = 0
+        total_predictions = sum(len(player_predictions) for player_predictions in predictions.values())
+        processed_predictions = 0
 
         for player, player_predictions in predictions.items():
             final_prediction_ids[player] = {}
@@ -260,9 +280,19 @@ class AnalysisService:
                     "vlm": vlm_decision,
                     "final": final,
                 })
+                processed_predictions += 1
+                if total_predictions > 0 and (
+                    processed_predictions == total_predictions
+                    or processed_predictions % max(1, total_predictions // 10) == 0
+                ):
+                    self._emit_progress(
+                        progress_callback,
+                        65 + int(17 * processed_predictions / total_predictions),
+                    )
 
         # 6. Temporal Smoothing
         apply_temporal_smoothing(output_records, final_prediction_ids, self.settings.smoothing_confidence)
+        self._emit_progress(progress_callback, 84)
         
         # Build Response
         summary_dict = summarize_records(output_records)
@@ -276,6 +306,7 @@ class AnalysisService:
             jersey_number_verifier=jersey_number_verifier,
             jersey_number_frames=effective_jersey_number_vlm_frames,
         )
+        self._emit_progress(progress_callback, 90)
         identity_embedding_model = (
             player_identity_features[0].embedding_model
             if player_identity_features
@@ -337,10 +368,15 @@ class AnalysisService:
             json_path = os.path.join(self.settings.output_dir, f"{analysis_id}.json")
             with open(json_path, "w") as fp:
                 fp.write(response.model_dump_json(indent=2))
+        self._emit_progress(progress_callback, 95)
 
         return response
 
-    def run_long_video_analysis(self, request: AnalysisRequest) -> AnalysisResponse:
+    def run_long_video_analysis(
+        self,
+        request: AnalysisRequest,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> AnalysisResponse:
         """Run segmented analysis and VLM contact-sheet audit for long videos."""
         started_at = time.time()
         metadata = self._read_video_metadata(request.video_path)
@@ -362,6 +398,7 @@ class AnalysisService:
             segment_end_sec=request.segment_end_sec,
             max_segments=request.max_segments,
         )
+        self._emit_progress(progress_callback, 10)
         effective_vid_stride = (
             request.vid_stride
             if request.vid_stride is not None
@@ -403,11 +440,23 @@ class AnalysisService:
         player_identity_features: Dict[str, PlayerIdentityFeatureResponse] = {}
         status_counts: Counter[str] = Counter()
 
+        total_segments = max(1, len(segment_ranges))
+
         for segment_index, segment in enumerate(segment_ranges):
+            segment_start_progress = 10 + int(80 * segment_index / total_segments)
+            segment_end_progress = 10 + int(80 * (segment_index + 1) / total_segments)
+
+            def segment_progress(local_progress: int) -> None:
+                scaled = segment_start_progress + int(
+                    (segment_end_progress - segment_start_progress) * max(0, min(100, int(local_progress))) / 100
+                )
+                self._emit_progress(progress_callback, scaled)
+
             self._log_progress(
                 f"Segment {segment_index + 1}/{len(segment_ranges)}: "
                 f"{segment['start_sec']:.2f}s-{segment['end_sec']:.2f}s."
             )
+            segment_progress(2)
             temp_path = self._write_video_segment(
                 request.video_path,
                 start_frame=segment["start_frame"],
@@ -428,7 +477,11 @@ class AnalysisService:
                         "vid_stride": effective_vid_stride,
                     }
                 )
-                segment_result = self._run_single_analysis(segment_request, persist_output=False)
+                segment_result = self._run_single_analysis(
+                    segment_request,
+                    persist_output=False,
+                    progress_callback=lambda progress: segment_progress(min(82, progress)),
+                )
             finally:
                 try:
                     os.remove(temp_path)
@@ -475,6 +528,7 @@ class AnalysisService:
             player_count = len({record.player for record in segment_result.records})
             vlm_audit = None
             if verifier is not None:
+                segment_progress(84)
                 self._log_progress(
                     f"Segment {segment_index + 1}/{len(segment_ranges)} VLM audit start: "
                     f"frames={request.vlm_audit_frames}."
@@ -492,6 +546,7 @@ class AnalysisService:
                     f"Segment {segment_index + 1}/{len(segment_ranges)} VLM audit done: "
                     f"available={vlm_audit.available}, confidence={vlm_audit.confidence:.2f}."
                 )
+                segment_progress(96)
 
             audit_status, audit_notes = self._compare_segment_with_vlm(
                 player_count=player_count,
@@ -503,6 +558,7 @@ class AnalysisService:
                 f"Segment {segment_index + 1}/{len(segment_ranges)} complete: "
                 f"players={player_count}, clips={segment_result.summary.clip_count}, audit={audit_status}."
             )
+            segment_progress(100)
 
             segment_outputs.append(
                 LongVideoSegmentResponse(
@@ -519,6 +575,7 @@ class AnalysisService:
                 )
             )
 
+        self._emit_progress(progress_callback, 92)
         global_summary = self._summarize_response_records(merged_records)
         player_summaries = [
             LongVideoPlayerSummaryResponse(
@@ -586,6 +643,7 @@ class AnalysisService:
                 if segment.vlm_audit is not None
             },
         )
+        self._emit_progress(progress_callback, 96)
 
         audit_summary = LongVideoAuditSummaryResponse(
             total_segments=len(segment_outputs),

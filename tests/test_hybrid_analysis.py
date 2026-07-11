@@ -1622,6 +1622,62 @@ class HybridAnalysisTest(unittest.TestCase):
         self.assertEqual(segment_request.vlm_mode, "low-confidence")
         self.assertFalse(segment_request.segmented_analysis)
 
+    def test_segmented_analysis_emits_intermediate_progress(self):
+        from unittest.mock import MagicMock, patch
+        from app.analysis.service import AnalysisService
+        from app.config import Settings
+        from app.analysis.schemas import AnalysisResponse, AnalysisRequest, AnalysisSummaryResponse, Size2D
+
+        service = AnalysisService(settings=Settings(), model=MagicMock(), device="cpu")
+        request = AnalysisRequest(
+            video_path="examples/lebron_shoots.mp4",
+            generate_video=False,
+            segmented_analysis=True,
+            vlm_mode="off",
+            vlm_audit=False,
+        )
+        segment_response = AnalysisResponse(
+            video="segment.mp4",
+            created_at_unix=1.0,
+            runtime_seconds=0.1,
+            frame_size=Size2D(width=64, height=64),
+            seq_length=16,
+            vid_stride=8,
+            vlm_mode="off",
+            ollama_model=None,
+            records=[],
+            summary=AnalysisSummaryResponse(
+                clip_count=0,
+                action_counts={},
+                needs_review_count=0,
+                source_counts={},
+            ),
+            player_identity_features=[],
+        )
+        progress_updates = []
+
+        with patch.object(
+            service,
+            "_read_video_metadata",
+            return_value={"fps": 10.0, "frame_count": 40, "duration_sec": 4.0, "width": 64, "height": 64},
+        ), patch.object(
+            service,
+            "_build_segment_ranges",
+            return_value=[
+                {"segment_id": 0, "start_sec": 0.0, "end_sec": 2.0, "start_frame": 0, "end_frame": 19},
+                {"segment_id": 1, "start_sec": 2.0, "end_sec": 4.0, "start_frame": 20, "end_frame": 39},
+            ],
+        ), patch.object(service, "_write_video_segment", return_value="missing-temp-segment.mp4"), patch.object(
+            service,
+            "_run_single_analysis",
+            return_value=segment_response,
+        ):
+            service.run_long_video_analysis(request, progress_callback=progress_updates.append)
+
+        self.assertIn(10, progress_updates)
+        self.assertTrue(any(10 < progress < 100 for progress in progress_updates))
+        self.assertGreaterEqual(max(progress_updates), 96)
+
     def test_run_analysis_defaults_to_segmented_mode(self):
         from unittest.mock import MagicMock, patch
         from app.analysis.service import AnalysisService
@@ -1634,7 +1690,48 @@ class HybridAnalysisTest(unittest.TestCase):
         with patch.object(service, "run_long_video_analysis") as mock_long:
             service.run_analysis(request)
 
-        mock_long.assert_called_once_with(request)
+        mock_long.assert_called_once_with(request, progress_callback=None)
+
+    def test_background_analysis_forwards_progress_callback(self):
+        from app.analysis.router import bg_run_analysis
+        from app.analysis.task_manager import TaskManager
+        from app.analysis.schemas import AnalysisResponse, AnalysisRequest, AnalysisSummaryResponse, Size2D
+
+        class FakeService:
+            def run_analysis(self, request, progress_callback=None):
+                progress_callback(42)
+                return AnalysisResponse(
+                    video=request.video_path,
+                    created_at_unix=1.0,
+                    runtime_seconds=0.1,
+                    frame_size=Size2D(width=64, height=64),
+                    seq_length=16,
+                    vid_stride=8,
+                    vlm_mode="off",
+                    ollama_model=None,
+                    records=[],
+                    summary=AnalysisSummaryResponse(
+                        clip_count=0,
+                        action_counts={},
+                        needs_review_count=0,
+                        source_counts={},
+                    ),
+                    player_identity_features=[],
+                )
+
+        task_manager = TaskManager()
+        task_id = task_manager.create_task()
+        bg_run_analysis(
+            task_id,
+            AnalysisRequest(video_path="examples/lebron_shoots.mp4", vlm_mode="off", segmented_analysis=False),
+            FakeService(),
+            task_manager,
+        )
+
+        state = task_manager.get_task(task_id)
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.progress, 100)
+        self.assertIsNotNone(state.result)
 
     def test_player_statistics_estimate_from_action_counts(self):
         from unittest.mock import MagicMock
