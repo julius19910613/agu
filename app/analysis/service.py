@@ -1617,19 +1617,25 @@ class AnalysisService:
             current: List[AnalysisRecordResponse] = []
             for record in sorted(player_records, key=lambda item: item.start_frame):
                 if current and int(record.start_frame) - int(current[-1].end_frame) > max_gap:
-                    candidates.append(self._make_block_candidate(player_id, current))
+                    candidate = self._make_block_candidate(player_id, current)
+                    if candidate is not None:
+                        candidates.append(candidate)
                     current = []
                 current.append(record)
             if current:
-                candidates.append(self._make_block_candidate(player_id, current))
+                candidate = self._make_block_candidate(player_id, current)
+                if candidate is not None:
+                    candidates.append(candidate)
         return candidates
 
     def _make_block_candidate(
         self,
         player_id: str,
         records: List[AnalysisRecordResponse],
-    ) -> EventCandidateResponse:
+    ) -> Optional[EventCandidateResponse]:
         avg_confidence = sum(float(record.final.confidence) for record in records) / max(1, len(records))
+        if len(records) < 2 and avg_confidence < 0.75:
+            return None
         segment_ids = sorted({record.segment_id for record in records if record.segment_id is not None})
         return EventCandidateResponse(
             event_type="block_candidate",
@@ -1642,6 +1648,7 @@ class AnalysisService:
             status="candidate_requires_ball_rim_or_vlm_confirmation",
             evidence=[
                 f"{len(records)} contiguous block-classified clips",
+                f"average block confidence {avg_confidence:.2f}",
                 "downgraded from official block because ball/rim/shot evidence is not available",
             ],
         )

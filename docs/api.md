@@ -318,6 +318,11 @@ evidence:
 | `evidence` | array | Human-readable evidence notes |
 | `owner_candidates` | array | Ranked nearby player candidates for actor selection or review |
 
+`block_candidate` is intentionally conservative: a single block-classified clip
+is promoted only when its average confidence is high enough; otherwise AGU keeps
+the action record but does not expose it as an event candidate. This avoids
+turning isolated R(2+1)D block noise into a box-score event.
+
 Each `owner_candidates[]` item contains:
 
 | Field | Type | Meaning |

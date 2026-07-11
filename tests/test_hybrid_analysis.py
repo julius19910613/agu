@@ -264,6 +264,28 @@ class HybridAnalysisTest(unittest.TestCase):
         self.assertEqual(rebound.owner_candidates[0].rank, 1)
         self.assertGreaterEqual(rebound.owner_candidates[0].score, rebound.owner_candidates[-1].score)
 
+    def test_single_low_confidence_block_does_not_become_event_candidate(self):
+        service = self.make_service()
+        records = [
+            self.make_record(1, "block", 10, 25, confidence=0.62),
+            self.make_record(2, "dribble", 20, 35, confidence=0.8),
+        ]
+
+        candidates = service._detect_event_candidates(records)
+
+        self.assertFalse(any(candidate.event_type == "block_candidate" for candidate in candidates))
+
+    def test_repeated_block_clips_remain_event_candidate(self):
+        service = self.make_service()
+        records = [
+            self.make_record(1, "block", 10, 25, confidence=0.62),
+            self.make_record(1, "block", 30, 45, confidence=0.66),
+        ]
+
+        candidates = service._detect_event_candidates(records)
+
+        self.assertTrue(any(candidate.event_type == "block_candidate" for candidate in candidates))
+
     def test_confirmed_identity_merges_emit_merged_player_statistics(self):
         service = self.make_service()
         summaries = [
