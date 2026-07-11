@@ -79,7 +79,8 @@ basketball video -> player tracks -> action clips -> structured JSON + optional 
   - duplicate candidate 会使用采样 frame-level bbox 判断同屏硬冲突和重复框重叠。
   - 请求体可传 `confirmed_identity_merges[]`，确认后的聚合统计会输出到 `result.long_video.merged_players[]`，原始 `players[]` 不会被覆盖。
   - 可选 `vlm_identity_merge_enabled=true` 后，VLM 会审核 duplicate candidates，并把高置信 same-player 决策转为 `confirmed_identity_merges[]`。
-  - `result.long_video.event_candidates[]` 提供 `block_candidate`、`rebound_candidate`、`steal_candidate` 事件线索。
+  - `result.long_video.event_candidates[]` 提供 `block_candidate`、`rebound_candidate`、`steal_candidate` 事件线索，并通过 `owner_candidates[]` 输出候选事件归属球员排名。
+  - `result.long_video.identity_graph_summary` 汇总身份图节点、重复候选、确认合并和 VLM merge 决策数量。
 - 推理加速：
   - `BASKETBALL_TRACKING_FPS=8.0` 对 YOLO 跟踪做低帧率采样。
   - `BASKETBALL_YOLO_IMGSZ=320` 降低 YOLO 输入尺寸。
@@ -90,6 +91,7 @@ basketball video -> player tracks -> action clips -> structured JSON + optional 
 - 球员技术统计估算：
   - `statistics.points`、`assists`、`rebounds`、`blocks`、`steals`。
   - 当前为 `action_proxy_v1`，不是正式技术统计；points 来自 `shoot`，assists 来自 `pass`。
+  - `statistics.status`、`estimated_fields`、`candidate_fields` 会标出哪些字段只是估算、哪些字段仍需事件确认。
   - `block` 不再直接计入正式 `statistics.blocks`；会先输出 `block_candidate`，等待球/篮筐/投篮或 VLM 确认。
   - `rebound_candidate` 和 `steal_candidate` 由简化球权状态线索生成，仍需球检测、篮筐检测或 VLM/人工确认。
 - 输出文件：
@@ -156,9 +158,10 @@ curl -sS -X POST http://127.0.0.1:8765/api/v1/analysis/run \
 ```bash
 python -m app.cli analyze \
   --video examples/lebron_shoots.mp4 \
-  --vlm-mode off \
-  --max-frames 120 \
-  --no-generate-video
+  --preset accurate \
+  --poll \
+  --summary \
+  --save-result analysis_outputs/example-analysis.json
 ```
 
 查询任务：
@@ -166,6 +169,39 @@ python -m app.cli analyze \
 ```bash
 python -m app.cli status <task_id>
 ```
+
+CLI 常用 preset：
+
+| Preset | 用途 | 说明 |
+| --- | --- | --- |
+| `fast` | 快速冒烟 | 关闭 VLM audit，降低跟踪成本 |
+| `accurate` | 常规准确率优先 | 开启低置信 VLM、VLM audit、BoT-SORT/ReID 和更高跟踪召回 |
+| `vlm-full` | 全程 VLM 复核 | 在 `accurate` 基础上使用 `vlm_mode=always` 并启用 VLM identity merge |
+
+生成球员截图、证据视频和 roster 汇总：
+
+```bash
+python -m app.cli report \
+  --analysis-json analysis_outputs/example-analysis.json \
+  --video examples/lebron_shoots.mp4 \
+  --output-dir analysis_outputs/example-player-reports \
+  --dedupe-players \
+  --vlm-player-filter \
+  --min-roster-score 18
+```
+
+用人工事件 CSV 做可重复准确率评测：
+
+```bash
+python -m app.cli evaluate \
+  --analysis-json analysis_outputs/example-analysis.json \
+  --events-csv labels/events.csv \
+  --require-player \
+  --output-json analysis_outputs/example-eval.json \
+  --output-md analysis_outputs/example-eval.md
+```
+
+CLI 准确率路线和每阶段架构 review 见 `docs/cli-accuracy-roadmap.md`。
 
 ### 目录结构
 
@@ -423,6 +459,11 @@ high_confidence           可选，覆盖高置信度阈值
   --output-dir analysis_outputs/player_markdown_reports
 ```
 
+该脚本除 `index.md`、每个球员的 Markdown 与证据素材外，还会额外输出：
+
+- `roster-summary.json`：面向程序消费的最终 roster 摘要，包含 `global_player_id`、阵营候选、号码候选、得分/篮板/助攻/抢断/盖帽、置信度、support score 与备注。
+- `roster-summary.md`：面向人工复核的最终 roster 表格与备注摘要。
+
 如需让 VLM 对绿色框选目标做二次复核，并过滤明确不是球员的结果：
 
 ```bash
@@ -441,7 +482,7 @@ high_confidence           可选，覆盖高置信度阈值
   --vlm-progress
 ```
 
-全量常态使用建议复用同一个 `--vlm-cache-path`。脚本会在每个 player 的 VLM 判断完成后立即写入缓存；如果中途停止，下一次重跑会跳过已验证过的框选截图。报告截图面向人工审阅时，建议同时使用 `--dedupe-players --max-players 18 --require-vlm-player`，避免把重复身份或明确非球员框写成独立球员报告。
+全量常态使用建议复用同一个 `--vlm-cache-path`。脚本会在每个 player 的 VLM 判断完成后立即写入缓存；如果中途停止，下一次重跑会跳过已验证过的框选截图。报告截图面向人工审阅时，建议至少使用 `--dedupe-players --max-players 18`；当存在大量噪声短轨迹时，可再叠加 `--min-roster-score 18` 和 `--require-vlm-player`，避免把重复身份或明确非球员框写成独立球员报告。
 
 ### Legacy 入口状态
 
@@ -504,7 +545,7 @@ Current identity and statistics behavior:
 - `long_video.identity_duplicate_candidates[]` exposes review-only duplicate-ID merge candidates and does not rewrite statistics automatically.
 - `long_video.identity_merge_decisions[]` exposes optional VLM post-processing decisions when `vlm_identity_merge_enabled=true`.
 - `long_video.merged_players[]` exposes confirmed-merge statistics when `confirmed_identity_merges[]` is supplied in the request.
-- `statistics.points`, `assists`, `rebounds`, `blocks`, and `steals` are action-proxy estimates, not official box-score truth. Block, rebound, and steal evidence should be confirmed through event candidates, ball/rim/possession evidence, VLM, or human review.
+- `statistics.points`, `assists`, `rebounds`, `blocks`, and `steals` are action-proxy estimates, not official box-score truth. The `statistics.status`, `estimated_fields`, and `candidate_fields` fields make that contract explicit. Block, rebound, and steal evidence should be confirmed through event candidates, owner candidates, ball/rim/possession evidence, VLM, or human review.
 
 Setup:
 

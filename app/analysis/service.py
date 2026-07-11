@@ -20,9 +20,11 @@ from app.analysis.schemas import (
     AnalysisRecordResponse,
     AnalysisSummaryResponse,
     EventCandidateResponse,
+    EventOwnerCandidateResponse,
     ConfirmedIdentityMergeResponse,
     LongVideoAnalysisResponse,
     LongVideoAuditSummaryResponse,
+    IdentityGraphSummaryResponse,
     LongVideoPlayerSummaryResponse,
     MergedLongVideoPlayerSummaryResponse,
     LongVideoSegmentResponse,
@@ -35,6 +37,7 @@ from app.analysis.schemas import (
 )
 from app.analysis.tracking import extract_tracked_frames, crop_windows
 from app.analysis.identity_embedding import BaseIdentityEmbedder, build_identity_embedder
+from app.analysis.event_owner import build_event_owner_candidates
 from app.analysis.inference import predict_player_clips
 from app.analysis.motion import compute_motion_features
 from app.analysis.vlm import OllamaVLMVerifier
@@ -421,7 +424,7 @@ class AnalysisService:
                         "segmented_analysis": False,
                         "generate_video": False,
                         "max_frames": None,
-                        "vlm_mode": "off",
+                        "vlm_mode": request.vlm_mode,
                         "vid_stride": effective_vid_stride,
                     }
                 )
@@ -472,6 +475,10 @@ class AnalysisService:
             player_count = len({record.player for record in segment_result.records})
             vlm_audit = None
             if verifier is not None:
+                self._log_progress(
+                    f"Segment {segment_index + 1}/{len(segment_ranges)} VLM audit start: "
+                    f"frames={request.vlm_audit_frames}."
+                )
                 audit_frames = self._sample_contact_sheet_frames(
                     request.video_path,
                     start_frame=segment["start_frame"],
@@ -481,6 +488,10 @@ class AnalysisService:
                 contact_sheet = self._make_contact_sheet(audit_frames)
                 scope = f"{segment['start_sec']:.1f}s-{segment['end_sec']:.1f}s"
                 vlm_audit = verifier.audit_video_frames([contact_sheet], scope=scope)
+                self._log_progress(
+                    f"Segment {segment_index + 1}/{len(segment_ranges)} VLM audit done: "
+                    f"available={vlm_audit.available}, confidence={vlm_audit.confidence:.2f}."
+                )
 
             audit_status, audit_notes = self._compare_segment_with_vlm(
                 player_count=player_count,
@@ -611,6 +622,12 @@ class AnalysisService:
                 identity_merge_decisions=identity_merge_decisions,
                 confirmed_identity_merges=confirmed_identity_merges,
                 merged_players=merged_player_summaries,
+                identity_graph_summary=self._build_identity_graph_summary(
+                    player_summaries=player_summaries,
+                    duplicate_candidates=identity_duplicate_candidates,
+                    confirmed_merges=confirmed_identity_merges,
+                    merge_decisions=identity_merge_decisions,
+                ),
                 audit_summary=audit_summary,
             ),
         )
@@ -1554,8 +1571,33 @@ class AnalysisService:
         candidates.extend(self._detect_block_candidates(sorted_records))
         candidates.extend(self._detect_rebound_candidates(sorted_records))
         candidates.extend(self._detect_steal_candidates(sorted_records))
+        candidates = [
+            self._attach_event_owner_candidates(candidate, sorted_records)
+            for candidate in candidates
+        ]
         candidates.sort(key=lambda event: (event.start_frame, event.event_type, event.player_id or ""))
         return candidates[:500]
+
+    def _attach_event_owner_candidates(
+        self,
+        candidate: EventCandidateResponse,
+        records: List[AnalysisRecordResponse],
+    ) -> EventCandidateResponse:
+        owner_candidates = build_event_owner_candidates(
+            records,
+            event_type=candidate.event_type,
+            start_frame=candidate.start_frame,
+            end_frame=candidate.end_frame,
+            primary_player_id=candidate.player_id,
+        )
+        return candidate.model_copy(
+            update={
+                "owner_candidates": [
+                    EventOwnerCandidateResponse(**owner_candidate)
+                    for owner_candidate in owner_candidates
+                ]
+            }
+        )
 
     def _record_player_key(self, record: AnalysisRecordResponse) -> str:
         return record.global_player_id or record.local_player_id or f"player_{record.player}"
@@ -1715,6 +1757,30 @@ class AnalysisService:
             blocks=0,
             steals=steals,
             confidence=0.35 if (shots or passes or block_candidates or rebounds or steals) else 0.15,
+            status="estimate_requires_event_confirmation",
+            estimated_fields=["points", "assists"],
+            candidate_fields=["rebounds", "blocks", "steals"],
+            notes=notes,
+        )
+
+    def _build_identity_graph_summary(
+        self,
+        player_summaries: List[LongVideoPlayerSummaryResponse],
+        duplicate_candidates: List[IdentityDuplicateCandidateResponse],
+        confirmed_merges: List[ConfirmedIdentityMergeResponse],
+        merge_decisions: List[VLMIdentityMergeDecisionResponse],
+    ) -> IdentityGraphSummaryResponse:
+        notes = [
+            "identity graph is review-oriented and does not mutate original segment-local players",
+            "confirmed_identity_merges or high-confidence VLM merge decisions are required before merged_players are emitted",
+        ]
+        if duplicate_candidates:
+            notes.append("duplicate candidates are ranked by appearance, team color, action, temporal compatibility, and bbox conflict checks")
+        return IdentityGraphSummaryResponse(
+            node_count=len([summary for summary in player_summaries if summary.global_player_id]),
+            duplicate_candidate_count=len(duplicate_candidates),
+            confirmed_merge_count=len(confirmed_merges),
+            vlm_decision_count=len(merge_decisions),
             notes=notes,
         )
 

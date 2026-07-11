@@ -239,6 +239,11 @@ Important request fields:
 | `average_confidence` | number | Average final action confidence |
 | `statistics` | object | Estimated points, assists, rebounds, blocks, and steals |
 
+`statistics` includes `status`, `estimated_fields`, and `candidate_fields`.
+The current `action_proxy_v1` implementation marks points and assists as
+estimated fields, while blocks, rebounds, and steals remain candidate fields
+until event confirmation is available.
+
 `result.long_video.identity_duplicate_candidates[]` contains conservative
 post-stitch duplicate-ID review candidates. These candidates do not rewrite
 statistics automatically; they expose evidence for VLM or human confirmation.
@@ -258,6 +263,11 @@ instructions supplied in the request. `result.long_video.merged_players[]`
 contains the aggregate player summaries produced from those confirmed merges.
 This is a separate audit-safe view: original `players[]` and `records[]` remain
 unchanged.
+
+`result.long_video.identity_graph_summary` provides an overview of the review
+graph: node count, duplicate candidate count, confirmed merge count, VLM merge
+decision count, method, and notes. It is informational and does not mutate
+player summaries.
 
 When `vlm_identity_merge_enabled=true`, AGU sends the top
 `identity_duplicate_candidates[]` to the configured VLM using labeled LEFT/RIGHT
@@ -306,6 +316,21 @@ evidence:
 | `method` | string | Candidate generation method |
 | `status` | string | Confirmation requirement |
 | `evidence` | array | Human-readable evidence notes |
+| `owner_candidates` | array | Ranked nearby player candidates for actor selection or review |
+
+Each `owner_candidates[]` item contains:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `global_player_id` | string | Candidate event-owner player ID |
+| `local_player_ids` | array | Segment-local tracks supporting the candidate |
+| `rank` | integer | Rank within the event candidate |
+| `score` | number | Deterministic owner score from confidence, temporal proximity, action hints, identity confidence, and support |
+| `clip_count` | integer | Nearby clips for the candidate |
+| `action_match_count` | integer | Nearby clips whose action matches the event hint set |
+| `avg_confidence` | number | Average final action confidence for relevant clips |
+| `nearest_frame_gap` | integer | Nearest supporting clip distance from the event center |
+| `evidence` | array | Human-readable owner-scoring evidence |
 
 Known MVP boundary: `global_player_id` is a conservative candidate generated
 from adjacent segment action, configured appearance embedding, and track-continuity

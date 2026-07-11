@@ -22,6 +22,7 @@ def _write_sample_video(path: Path) -> None:
 
 def _sample_analysis() -> dict:
     return {
+        "frame_size": {"width": 64, "height": 64},
         "records": [
             {
                 "start_frame": 2,
@@ -158,7 +159,10 @@ def test_build_player_markdown_reports_writes_per_player_assets(tmp_path: Path) 
     )
 
     assert summary["player_count"] == 1
+    assert summary["roster_player_count"] == 1
     assert Path(summary["index_markdown"]).exists()
+    assert Path(summary["roster_json"]).exists()
+    assert Path(summary["roster_markdown"]).exists()
     report = summary["reports"][0]
     player_markdown = Path(report["markdown"])
     markdown_text = player_markdown.read_text(encoding="utf-8")
@@ -170,6 +174,9 @@ def test_build_player_markdown_reports_writes_per_player_assets(tmp_path: Path) 
     assert Path(report["screenshot"]).exists()
     assert Path(report["contact_sheet"]).exists()
     assert Path(report["video"]).exists()
+    roster = Path(summary["roster_json"]).read_text(encoding="utf-8")
+    assert "team_or_side" in roster
+    assert "jersey_number_candidate" in roster
 
 
 def test_build_player_markdown_reports_filters_vlm_non_players(tmp_path: Path) -> None:
@@ -197,6 +204,9 @@ def test_build_player_markdown_reports_filters_vlm_non_players(tmp_path: Path) -
 
     assert summary["player_count"] == 0
     assert summary["filtered_player_count"] == 1
+    assert summary["roster_player_count"] == 0
+    roster_payload = Path(summary["roster_json"]).read_text(encoding="utf-8")
+    assert '"player_count": 0' in roster_payload
     assert summary["filtered_players"][0]["global_player_id"] == "player_001"
     assert not (tmp_path / "reports" / "player_001.md").exists()
 
@@ -241,6 +251,11 @@ def test_build_player_markdown_reports_dedupes_similar_global_players(tmp_path: 
     assert kept_ids == {"player_001", "player_003"}
     assert summary["dedupe"]["dropped_players"][0]["global_player_id"] == "player_002"
     assert summary["dedupe"]["dropped_players"][0]["duplicate_of"] == "player_001"
+    roster_entries = summary["roster_player_count"]
+    assert roster_entries == 2
+    roster_payload = Path(summary["roster_json"]).read_text(encoding="utf-8")
+    assert "\"points\": 4" in roster_payload
+    assert "\"merged_from_global_player_ids\": [" in roster_payload
 
 
 def test_build_player_markdown_reports_reuses_vlm_cache(tmp_path: Path) -> None:
@@ -281,3 +296,57 @@ def test_build_player_markdown_reports_reuses_vlm_cache(tmp_path: Path) -> None:
     assert first["player_count"] == 1
     assert second["player_count"] == 1
     assert second["reports"][0]["vlm_player_verification"]["cache_hit"] is True
+
+
+def test_build_player_markdown_reports_can_filter_low_support_roster_players(tmp_path: Path) -> None:
+    video_path = tmp_path / "sample.mp4"
+    _write_sample_video(video_path)
+    analysis = _sample_analysis_with_duplicate_players()
+    analysis["long_video"]["players"].append(
+        {
+            "player_id": "segment_3:player_4",
+            "global_player_id": "player_004",
+            "clip_count": 1,
+            "segments_seen": 1,
+            "needs_review_count": 0,
+            "action_counts": {"no_action": 1},
+            "statistics": {
+                "points": 0,
+                "assists": 0,
+                "rebounds": 0,
+                "blocks": 0,
+                "steals": 0,
+            },
+            "identity_confidence": 0.25,
+            "identity_evidence": ["low support synthetic identity evidence"],
+        }
+    )
+    analysis["player_identity_features"].append(
+        {
+            "local_player_id": "segment_3:player_4",
+            "start_frame": 2,
+            "track_coverage": 0.05,
+            "appearance_signature": {
+                "h_mean": 0.1,
+                "s_mean": 0.1,
+                "v_mean": 0.1,
+                "b_mean": 0.1,
+                "g_mean": 0.1,
+                "r_mean": 0.1,
+            },
+            "sampled_boxes": [
+                {"frame": 2, "x": 1, "y": 1, "w": 3, "h": 4},
+            ],
+        }
+    )
+
+    summary = build_player_markdown_reports(
+        analysis=analysis,
+        video_path=str(video_path),
+        output_dir=str(tmp_path / "reports"),
+        crops_per_player=1,
+        min_roster_score=10.0,
+    )
+
+    assert summary["roster_player_count"] == 3
+    assert summary["roster_score_filtered_players"][0]["global_player_id"] == "player_004"

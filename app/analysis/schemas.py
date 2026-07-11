@@ -97,6 +97,9 @@ class PlayerBoxScoreEstimateResponse(BaseModel):
     steals: int = 0
     confidence: float = 0.0
     method: str = "action_proxy_v1"
+    status: str = "estimate_requires_confirmation"
+    estimated_fields: List[str] = Field(default_factory=list)
+    candidate_fields: List[str] = Field(default_factory=list)
     notes: List[str] = Field(default_factory=list)
 
 
@@ -157,6 +160,19 @@ class EventCandidateResponse(BaseModel):
     method: str
     status: str = "candidate"
     evidence: List[str] = Field(default_factory=list)
+    owner_candidates: List["EventOwnerCandidateResponse"] = Field(default_factory=list)
+
+
+class EventOwnerCandidateResponse(BaseModel):
+    global_player_id: str
+    local_player_ids: List[str] = Field(default_factory=list)
+    rank: int
+    score: float
+    clip_count: int
+    action_match_count: int
+    avg_confidence: float
+    nearest_frame_gap: int
+    evidence: List[str] = Field(default_factory=list)
 
 
 class IdentityDuplicateCandidateResponse(BaseModel):
@@ -202,6 +218,15 @@ class LongVideoAuditSummaryResponse(BaseModel):
     status_counts: Dict[str, int]
 
 
+class IdentityGraphSummaryResponse(BaseModel):
+    node_count: int = 0
+    duplicate_candidate_count: int = 0
+    confirmed_merge_count: int = 0
+    vlm_decision_count: int = 0
+    method: str = "identity_graph_review_v1"
+    notes: List[str] = Field(default_factory=list)
+
+
 class LongVideoAnalysisResponse(BaseModel):
     mode: str = "long_video_segmented"
     duration_sec: float
@@ -216,6 +241,7 @@ class LongVideoAnalysisResponse(BaseModel):
     identity_merge_decisions: List[VLMIdentityMergeDecisionResponse] = Field(default_factory=list)
     confirmed_identity_merges: List[ConfirmedIdentityMergeResponse] = Field(default_factory=list)
     merged_players: List[MergedLongVideoPlayerSummaryResponse] = Field(default_factory=list)
+    identity_graph_summary: IdentityGraphSummaryResponse = Field(default_factory=IdentityGraphSummaryResponse)
     audit_summary: LongVideoAuditSummaryResponse
 
 

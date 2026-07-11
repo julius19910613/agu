@@ -243,7 +243,26 @@ class HybridAnalysisTest(unittest.TestCase):
         stats = service._estimate_player_statistics(Counter({"block": 5, "shoot": 1}))
         self.assertEqual(stats.points, 2)
         self.assertEqual(stats.blocks, 0)
+        self.assertEqual(stats.status, "estimate_requires_event_confirmation")
+        self.assertIn("points", stats.estimated_fields)
+        self.assertIn("blocks", stats.candidate_fields)
         self.assertTrue(any("block_candidate" in note for note in stats.notes))
+
+    def test_event_candidates_include_ranked_owner_candidates(self):
+        service = self.make_service()
+        records = [
+            self.make_record(1, "shoot", 10, 25, confidence=0.8),
+            self.make_record(2, "ball in hand", 35, 50, confidence=0.75),
+            self.make_record(3, "defense", 30, 45, confidence=0.7),
+        ]
+
+        candidates = service._detect_event_candidates(records)
+        rebound = next(candidate for candidate in candidates if candidate.event_type == "rebound_candidate")
+
+        self.assertEqual(rebound.player_id, "player_002")
+        self.assertTrue(rebound.owner_candidates)
+        self.assertEqual(rebound.owner_candidates[0].rank, 1)
+        self.assertGreaterEqual(rebound.owner_candidates[0].score, rebound.owner_candidates[-1].score)
 
     def test_confirmed_identity_merges_emit_merged_player_statistics(self):
         service = self.make_service()
@@ -977,6 +996,33 @@ class HybridAnalysisTest(unittest.TestCase):
             self.assertEqual(vlm_decision2.action, "shoot")
             self.assertEqual(vlm_decision2.confidence, 0.95)
 
+    def test_vlm_audit_uses_configured_image_width(self):
+        import json
+        from unittest.mock import patch, MagicMock
+        from app.analysis.vlm import OllamaVLMVerifier
+
+        verifier = OllamaVLMVerifier(model="test-model", host="http://localhost:11434", image_width=160)
+        frames = [np.zeros((128, 176, 3), dtype=np.uint8)]
+
+        with patch("app.analysis.vlm.encode_frames_jpeg", return_value=["encoded"]) as mock_encode, \
+             patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = json.dumps(
+                {
+                    "thinking": (
+                        '{"player_count_min": 1, "player_count_max": 2, '
+                        '"actions": ["dribble"], "confidence": 0.8}'
+                    )
+                }
+            ).encode("utf-8")
+            mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+            audit = verifier.audit_video_frames(frames, scope="0.0s-1.0s")
+
+        mock_encode.assert_called_once_with(frames, max_width=160)
+        self.assertTrue(audit.available)
+        self.assertEqual(audit.player_count_min, 1)
+
     def test_lifespan_mounts_static_directories_with_absolute_paths(self):
         from unittest.mock import patch, MagicMock
         from app.main import lifespan
@@ -1469,6 +1515,58 @@ class HybridAnalysisTest(unittest.TestCase):
         self.assertEqual(status, "fail_player_under_count")
         self.assertIn("VLM saw at least 5", notes[0])
 
+    def test_segmented_analysis_preserves_vlm_mode_inside_segments(self):
+        from unittest.mock import MagicMock, patch
+        from app.analysis.service import AnalysisService
+        from app.config import Settings
+        from app.analysis.schemas import AnalysisResponse, AnalysisRequest, AnalysisSummaryResponse, Size2D
+
+        service = AnalysisService(settings=Settings(), model=MagicMock(), device="cpu")
+        request = AnalysisRequest(
+            video_path="examples/lebron_shoots.mp4",
+            generate_video=False,
+            segmented_analysis=True,
+            vlm_mode="low-confidence",
+            vlm_audit=False,
+        )
+        segment_response = AnalysisResponse(
+            video="segment.mp4",
+            created_at_unix=1.0,
+            runtime_seconds=0.1,
+            frame_size=Size2D(width=64, height=64),
+            seq_length=16,
+            vid_stride=8,
+            vlm_mode="low-confidence",
+            ollama_model="test-model",
+            records=[],
+            summary=AnalysisSummaryResponse(
+                clip_count=0,
+                action_counts={},
+                needs_review_count=0,
+                source_counts={},
+            ),
+            player_identity_features=[],
+        )
+
+        with patch.object(
+            service,
+            "_read_video_metadata",
+            return_value={"fps": 10.0, "frame_count": 20, "duration_sec": 2.0, "width": 64, "height": 64},
+        ), patch.object(
+            service,
+            "_build_segment_ranges",
+            return_value=[{"segment_id": 0, "start_sec": 0.0, "end_sec": 2.0, "start_frame": 0, "end_frame": 19}],
+        ), patch.object(service, "_write_video_segment", return_value="missing-temp-segment.mp4"), patch.object(
+            service,
+            "_run_single_analysis",
+            return_value=segment_response,
+        ) as mock_single:
+            service.run_long_video_analysis(request)
+
+        segment_request = mock_single.call_args.args[0]
+        self.assertEqual(segment_request.vlm_mode, "low-confidence")
+        self.assertFalse(segment_request.segmented_analysis)
+
     def test_run_analysis_defaults_to_segmented_mode(self):
         from unittest.mock import MagicMock, patch
         from app.analysis.service import AnalysisService
@@ -1495,9 +1593,49 @@ class HybridAnalysisTest(unittest.TestCase):
         self.assertEqual(stats.points, 4)
         self.assertEqual(stats.assists, 3)
         self.assertEqual(stats.blocks, 0)
+        self.assertEqual(stats.status, "estimate_requires_event_confirmation")
         self.assertTrue(any("block_candidate" in note for note in stats.notes))
         self.assertEqual(stats.rebounds, 0)
         self.assertEqual(stats.steals, 0)
+
+    def test_identity_graph_summary_counts_review_nodes(self):
+        service = self.make_service()
+        summaries = [
+            LongVideoPlayerSummaryResponse(
+                player_id="segment_0:player_1",
+                global_player_id="player_001",
+                segments_seen=1,
+                clip_count=2,
+                action_counts={"shoot": 2},
+                needs_review_count=0,
+                average_confidence=0.8,
+            ),
+            LongVideoPlayerSummaryResponse(
+                player_id="segment_1:player_2",
+                global_player_id="player_002",
+                segments_seen=1,
+                clip_count=2,
+                action_counts={"shoot": 2},
+                needs_review_count=0,
+                average_confidence=0.8,
+            ),
+        ]
+        duplicate = IdentityDuplicateCandidateResponse(
+            left_global_player_id="player_001",
+            right_global_player_id="player_002",
+            confidence=0.7,
+        )
+
+        summary = service._build_identity_graph_summary(
+            player_summaries=summaries,
+            duplicate_candidates=[duplicate],
+            confirmed_merges=[],
+            merge_decisions=[],
+        )
+
+        self.assertEqual(summary.node_count, 2)
+        self.assertEqual(summary.duplicate_candidate_count, 1)
+        self.assertIn("review-oriented", summary.notes[0])
 
 
 if __name__ == "__main__":

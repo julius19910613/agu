@@ -252,7 +252,7 @@ class OllamaVLMVerifier:
         scope: str,
     ) -> VLMVideoAuditResponse:
         """Ask the VLM to audit a segment contact sheet for player count and actions."""
-        images = encode_frames_jpeg(frames, max_width=640)
+        images = encode_frames_jpeg(frames, max_width=max(160, int(self.image_width)))
         if not images:
             return VLMVideoAuditResponse(
                 available=False,
