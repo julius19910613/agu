@@ -16,6 +16,8 @@ from app.analysis.schemas import (
     JerseyNumberCandidateResponse,
     ModelPrediction,
     MotionFeatures,
+    ScoreboardCheckpointResponse,
+    ScoreboardSummaryResponse,
     VLMDecisionResponse,
     VLMIdentityMergeDecisionResponse,
     VLMVideoAuditResponse,
@@ -313,6 +315,90 @@ class OllamaVLMVerifier:
             raw_response=raw,
         )
 
+    def audit_scoreboard_frames(
+        self,
+        frames: Sequence[np.ndarray],
+        frame_times: Sequence[float],
+        frame_numbers: Sequence[int],
+        scope: str,
+    ) -> ScoreboardSummaryResponse:
+        """Ask the VLM to read visible scoreboards from sampled full-frame images."""
+        images = encode_frames_jpeg(frames, max_width=max(768, int(self.image_width)))
+        if not images:
+            return ScoreboardSummaryResponse(
+                enabled=True,
+                status="no_frames",
+                notes=["No frames were available for scoreboard audit."],
+            )
+
+        payload = {
+            "model": self.model,
+            "stream": False,
+            "prompt": self._build_scoreboard_prompt(frame_times, scope),
+            "images": images,
+            "format": "json",
+            "options": {"temperature": 0.0, "num_predict": 900},
+        }
+        request = urllib.request.Request(
+            f"{self.host}/api/generate",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            return ScoreboardSummaryResponse(
+                enabled=True,
+                status="vlm_unavailable",
+                notes=[f"Ollama VLM HTTP error {exc.code}: {detail}"],
+            )
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            return ScoreboardSummaryResponse(
+                enabled=True,
+                status="vlm_unavailable",
+                notes=[f"Ollama VLM unavailable: {exc}"],
+            )
+
+        raw = json.dumps(body)
+        try:
+            parsed, raw = parse_vlm_payload(body)
+        except (ValueError, json.JSONDecodeError) as exc:
+            return ScoreboardSummaryResponse(
+                enabled=True,
+                status="vlm_parse_failed",
+                notes=[f"VLM returned non-JSON scoreboard response: {exc}"],
+            )
+
+        checkpoints = _parse_scoreboard_checkpoints(
+            parsed.get("checkpoints"),
+            frame_times=frame_times,
+            frame_numbers=frame_numbers,
+            raw_response=raw,
+        )
+        final = _last_visible_scoreboard(checkpoints)
+        notes = _string_list(parsed.get("notes"))
+        if not final:
+            notes.append("No sampled scoreboard frame had both left_score and right_score.")
+        status = "ok" if final else "no_readable_scoreboard"
+        return ScoreboardSummaryResponse(
+            enabled=True,
+            status=status,
+            final_left_score=final.left_score if final else None,
+            final_right_score=final.right_score if final else None,
+            final_total_points=(
+                int(final.left_score) + int(final.right_score)
+                if final and final.left_score is not None and final.right_score is not None
+                else None
+            ),
+            final_time_sec=final.time_sec if final else None,
+            checkpoints=checkpoints,
+            notes=notes,
+        )
+
     def read_jersey_number(
         self,
         frames: Sequence[np.ndarray],
@@ -485,6 +571,20 @@ class OllamaVLMVerifier:
             f"Segment scope: {scope}."
         )
 
+    def _build_scoreboard_prompt(self, frame_times: Sequence[float], scope: str) -> str:
+        samples = ", ".join(f"{index}=t{time_sec:.1f}s" for index, time_sec in enumerate(frame_times))
+        return (
+            "You are reading the physical basketball scoreboard from sampled full-frame images. "
+            "Each image is one sample in order; the sample index and timestamp are also printed on the image. "
+            "Read only numbers that are visibly on the scoreboard. Do not infer a score from game action. "
+            "Two-digit scores are common; preserve the tens digit when it is visible, for example read 15 as 15, not 5. "
+            "If a scoreboard is not visible or too blurry for a sample, mark visible false and leave scores null. "
+            "Return only compact JSON with key checkpoints. checkpoints must be an array of objects with keys: "
+            "index, visible, left_score, right_score, period, game_clock, confidence, notes. "
+            "Use integer left_score and right_score when readable. Be conservative on blurry digits. "
+            f"Samples: {samples}. Scope: {scope}."
+        )
+
     def _build_jersey_number_prompt(self, scope: str) -> str:
         return (
             "You are reading a basketball player's jersey number from cropped player images. "
@@ -523,12 +623,68 @@ def _optional_int(value: Any) -> Optional[int]:
         return None
 
 
+def _optional_score(value: Any) -> Optional[int]:
+    score = _optional_int(value)
+    if score is None or score < 0 or score > 300:
+        return None
+    return score
+
+
 def _string_list(value: Any) -> List[str]:
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
     if isinstance(value, str) and value.strip():
         return [value.strip()]
     return []
+
+
+def _parse_scoreboard_checkpoints(
+    value: Any,
+    frame_times: Sequence[float],
+    frame_numbers: Sequence[int],
+    raw_response: str,
+) -> List[ScoreboardCheckpointResponse]:
+    if not isinstance(value, list):
+        return []
+
+    checkpoints: List[ScoreboardCheckpointResponse] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        index = _optional_int(item.get("index"))
+        if index is None or index < 0 or index >= len(frame_times):
+            continue
+        visible = bool(parse_optional_bool(item.get("visible")))
+        checkpoint = ScoreboardCheckpointResponse(
+            time_sec=float(frame_times[index]),
+            frame=int(frame_numbers[index]) if index < len(frame_numbers) else 0,
+            visible=visible,
+            left_score=_optional_score(item.get("left_score")),
+            right_score=_optional_score(item.get("right_score")),
+            period=str(item.get("period") or "").strip() or None,
+            game_clock=str(item.get("game_clock") or "").strip(),
+            confidence=clamp_float(item.get("confidence"), 0.0, 1.0, default=0.0),
+            notes=_string_list(item.get("notes")),
+            raw_response=raw_response,
+        )
+        checkpoints.append(checkpoint)
+    return checkpoints
+
+
+def _last_visible_scoreboard(
+    checkpoints: Sequence[ScoreboardCheckpointResponse],
+) -> Optional[ScoreboardCheckpointResponse]:
+    readable = [
+        checkpoint
+        for checkpoint in checkpoints
+        if checkpoint.visible
+        and checkpoint.left_score is not None
+        and checkpoint.right_score is not None
+        and checkpoint.confidence >= 0.2
+    ]
+    if not readable:
+        return None
+    return max(readable, key=lambda checkpoint: checkpoint.time_sec)
 
 
 def _normalize_jersey_number(value: Any) -> Optional[str]:

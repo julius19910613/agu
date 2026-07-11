@@ -91,6 +91,8 @@ class LongVideoSegmentResponse(BaseModel):
 
 class PlayerBoxScoreEstimateResponse(BaseModel):
     points: int = 0
+    shot_attempts: int = 0
+    point_candidate_count: int = 0
     assists: int = 0
     rebounds: int = 0
     blocks: int = 0
@@ -227,6 +229,32 @@ class IdentityGraphSummaryResponse(BaseModel):
     notes: List[str] = Field(default_factory=list)
 
 
+class ScoreboardCheckpointResponse(BaseModel):
+    time_sec: float
+    frame: int
+    visible: bool = False
+    left_score: Optional[int] = None
+    right_score: Optional[int] = None
+    period: Optional[str] = None
+    game_clock: str = ""
+    confidence: float = 0.0
+    source: str = "vlm_scoreboard_audit_v1"
+    notes: List[str] = Field(default_factory=list)
+    raw_response: str = ""
+
+
+class ScoreboardSummaryResponse(BaseModel):
+    enabled: bool = False
+    status: str = "disabled"
+    method: str = "vlm_scoreboard_audit_v1"
+    final_left_score: Optional[int] = None
+    final_right_score: Optional[int] = None
+    final_total_points: Optional[int] = None
+    final_time_sec: Optional[float] = None
+    checkpoints: List[ScoreboardCheckpointResponse] = Field(default_factory=list)
+    notes: List[str] = Field(default_factory=list)
+
+
 class LongVideoAnalysisResponse(BaseModel):
     mode: str = "long_video_segmented"
     duration_sec: float
@@ -242,6 +270,7 @@ class LongVideoAnalysisResponse(BaseModel):
     confirmed_identity_merges: List[ConfirmedIdentityMergeResponse] = Field(default_factory=list)
     merged_players: List[MergedLongVideoPlayerSummaryResponse] = Field(default_factory=list)
     identity_graph_summary: IdentityGraphSummaryResponse = Field(default_factory=IdentityGraphSummaryResponse)
+    scoreboard_summary: ScoreboardSummaryResponse = Field(default_factory=ScoreboardSummaryResponse)
     audit_summary: LongVideoAuditSummaryResponse
 
 
@@ -299,6 +328,9 @@ class AnalysisRequest(BaseModel):
     max_segments: Optional[int] = Field(default=None, description="Optional cap on long-video segments for smoke tests.")
     vlm_audit: bool = Field(default=True, description="If True, run VLM contact-sheet audit for each long-video segment.")
     vlm_audit_frames: int = Field(default=6, description="Number of frames to sample into each VLM audit contact sheet.")
+    scoreboard_audit: bool = Field(default=False, description="If True, ask VLM to read visible scoreboard samples for score consistency checks.")
+    scoreboard_audit_interval_sec: float = Field(default=120.0, description="Approximate interval between scoreboard review samples.")
+    scoreboard_audit_max_frames: int = Field(default=4, description="Maximum sampled frames sent to the scoreboard VLM audit.")
 
 
 

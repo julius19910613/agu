@@ -246,9 +246,24 @@ Important request fields:
 | `statistics` | object | Estimated points, assists, rebounds, blocks, and steals |
 
 `statistics` includes `status`, `estimated_fields`, and `candidate_fields`.
-The current `action_proxy_v1` implementation marks points and assists as
-estimated fields, while blocks, rebounds, and steals remain candidate fields
-until event confirmation is available.
+The current `action_proxy_v1` implementation marks assists as an estimated
+field. `shoot` clips are exposed as `shot_attempts` and
+`point_candidate_count`; points remain candidate evidence until a made-shot,
+free-throw, or scoreboard-linked scoring event is confirmed. Blocks, rebounds,
+and steals remain candidate fields until event confirmation is available.
+
+`result.long_video.scoreboard_summary` is populated when
+`scoreboard_audit=true` (enabled by CLI `accurate` and `vlm-full` presets). It
+contains sampled scoreboard checkpoints plus the latest readable final score:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `enabled` | boolean | Whether scoreboard audit was requested |
+| `status` | string | `ok`, `disabled`, `no_readable_scoreboard`, or VLM/error status |
+| `final_left_score` / `final_right_score` | integer or null | Latest readable left/right score |
+| `final_total_points` | integer or null | Sum of latest readable left/right score |
+| `final_time_sec` | number or null | Timestamp of the checkpoint used as final score |
+| `checkpoints[]` | array | Per-sample VLM scoreboard reads |
 
 `result.long_video.identity_duplicate_candidates[]` contains conservative
 post-stitch duplicate-ID review candidates. These candidates do not rewrite
@@ -304,10 +319,11 @@ converted into additional `confirmed_identity_merges[]`.
 | `statistics` | object | Aggregated estimated points, assists, rebounds, blocks, and steals |
 
 `statistics` is an action-proxy estimate, not official box-score truth. In the
-current model, points are estimated from `shoot` actions and assists from `pass`
-actions. Blocks, rebounds, and steals require event confirmation and should be
-read from `result.long_video.event_candidates` until ball/rim/possession
-confirmation is available.
+current model, `shoot` actions are shot-attempt/point candidates rather than
+made scores; assists are estimated from `pass` actions. Points, blocks,
+rebounds, and steals require event confirmation and should be read from
+`result.long_video.event_candidates` or `result.long_video.scoreboard_summary`
+until ball/rim/possession/scoreboard confirmation is available.
 
 `result.long_video.event_candidates[]` contains low/medium-confidence event
 evidence:

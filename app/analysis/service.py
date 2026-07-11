@@ -31,6 +31,7 @@ from app.analysis.schemas import (
     IdentityDuplicateCandidateResponse,
     PlayerIdentityFeatureResponse,
     PlayerBoxScoreEstimateResponse,
+    ScoreboardSummaryResponse,
     Size2D,
     VLMIdentityMergeDecisionResponse,
     VLMVideoAuditResponse,
@@ -652,6 +653,14 @@ class AnalysisService:
             failed=sum(count for status, count in status_counts.items() if status.startswith("fail")),
             status_counts=dict(status_counts),
         )
+        self._emit_progress(progress_callback, 97)
+        scoreboard_summary = self._run_scoreboard_audit(
+            request=request,
+            verifier=verifier,
+            duration_sec=duration_sec,
+            fps=fps,
+            frame_count=frame_count,
+        )
 
         response = AnalysisResponse(
             video=request.video_path,
@@ -693,6 +702,7 @@ class AnalysisService:
                     confirmed_merges=confirmed_identity_merges,
                     merge_decisions=identity_merge_decisions,
                 ),
+                scoreboard_summary=scoreboard_summary,
                 audit_summary=audit_summary,
             ),
         )
@@ -1020,6 +1030,133 @@ class AnalysisService:
             return [int(segment_part)]
         except ValueError:
             return []
+
+    def _run_scoreboard_audit(
+        self,
+        request: AnalysisRequest,
+        verifier: Optional[OllamaVLMVerifier],
+        duration_sec: float,
+        fps: float,
+        frame_count: int,
+    ) -> ScoreboardSummaryResponse:
+        if not request.scoreboard_audit:
+            return ScoreboardSummaryResponse(enabled=False, status="disabled")
+        if verifier is None:
+            return ScoreboardSummaryResponse(
+                enabled=True,
+                status="vlm_not_configured",
+                notes=["Scoreboard audit requires a configured VLM verifier."],
+            )
+
+        frames, times, frame_numbers = self._sample_scoreboard_audit_frames(
+            request.video_path,
+            duration_sec=duration_sec,
+            fps=fps,
+            frame_count=frame_count,
+            interval_sec=request.scoreboard_audit_interval_sec,
+            max_frames=request.scoreboard_audit_max_frames,
+        )
+        self._log_progress(
+            f"Scoreboard audit start: samples={len(frames)}, duration={duration_sec:.1f}s."
+        )
+        summary = verifier.audit_scoreboard_frames(
+            frames=frames,
+            frame_times=times,
+            frame_numbers=frame_numbers,
+            scope=f"full_video duration={duration_sec:.1f}s",
+        )
+        self._log_progress(
+            "Scoreboard audit done: "
+            f"status={summary.status}, final={summary.final_left_score}-{summary.final_right_score}."
+        )
+        return summary
+
+    def _sample_scoreboard_audit_frames(
+        self,
+        video_path: str,
+        duration_sec: float,
+        fps: float,
+        frame_count: int,
+        interval_sec: float,
+        max_frames: int,
+    ) -> tuple[List[np.ndarray], List[float], List[int]]:
+        max_frames = max(1, int(max_frames or 1))
+        duration_sec = max(0.0, float(duration_sec))
+        interval_sec = max(30.0, float(interval_sec or 120.0))
+        candidates = [0.0, min(60.0, duration_sec), min(90.0, duration_sec), min(120.0, duration_sec)]
+        t = interval_sec
+        while t < max(0.0, duration_sec - 30.0):
+            candidates.append(t)
+            t += interval_sec
+        candidates.extend(
+            [
+                max(0.0, duration_sec - 60.0),
+                max(0.0, duration_sec - 30.0),
+                max(0.0, duration_sec - 15.0),
+                max(0.0, duration_sec - 5.0),
+            ]
+        )
+        unique_times = sorted({round(min(max(0.0, value), duration_sec), 2) for value in candidates})
+        if len(unique_times) > max_frames:
+            head_count = max(1, max_frames // 3)
+            tail_count = max(2, max_frames // 3)
+            middle_count = max_frames - head_count - tail_count
+            middle = unique_times[head_count : len(unique_times) - tail_count]
+            if middle_count > 0 and middle:
+                indices = np.linspace(0, len(middle) - 1, middle_count, dtype=int)
+                selected_middle = [middle[int(index)] for index in indices]
+            else:
+                selected_middle = []
+            unique_times = unique_times[:head_count] + selected_middle + unique_times[-tail_count:]
+
+        cap = cv2.VideoCapture(video_path)
+        frames: List[np.ndarray] = []
+        times: List[float] = []
+        frame_numbers: List[int] = []
+        try:
+            if not cap.isOpened():
+                return frames, times, frame_numbers
+            for index, time_sec in enumerate(unique_times):
+                frame_number = min(max(0, int(round(time_sec * fps))), max(0, frame_count - 1))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    continue
+                frames.append(self._make_scoreboard_review_image(frame, sample_index=index, time_sec=time_sec))
+                times.append(float(time_sec))
+                frame_numbers.append(int(frame_number))
+        finally:
+            cap.release()
+        return frames, times, frame_numbers
+
+    def _make_scoreboard_review_image(
+        self,
+        frame: np.ndarray,
+        sample_index: int,
+        time_sec: float,
+    ) -> np.ndarray:
+        height, width = frame.shape[:2]
+        target_width = 960
+        scale = target_width / max(1, width)
+        full = cv2.resize(frame, (target_width, max(1, int(height * scale))), interpolation=cv2.INTER_AREA)
+        upper = frame[: max(1, int(height * 0.45)), :]
+        upper = cv2.resize(upper, (target_width, max(1, int(upper.shape[0] * scale * 1.8))), interpolation=cv2.INTER_CUBIC)
+        label_h = 44
+        canvas = np.zeros((label_h + full.shape[0] + upper.shape[0], target_width, 3), dtype=np.uint8)
+        canvas[:label_h, :] = (20, 20, 20)
+        cv2.putText(
+            canvas,
+            f"SAMPLE {sample_index}  t={time_sec:.1f}s",
+            (18, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        canvas[label_h : label_h + full.shape[0], :] = full
+        canvas[label_h + full.shape[0] :, :] = upper
+        return canvas
 
     def _read_video_metadata(self, video_path: str) -> Dict[str, float]:
         cap = cv2.VideoCapture(video_path)
@@ -1833,10 +1970,13 @@ class AnalysisService:
         rebounds = int(action_counts.get("rebound", 0))
         steals = int(action_counts.get("steal", 0))
         notes = [
-            "points are estimated as 2 per shoot action; made/missed shots are not detected yet",
+            "shoot actions are shot-attempt or shooting-motion candidates; made/missed outcomes are not detected yet",
+            "points remain 0 until a made-shot, free throw, or scoreboard-linked scoring event is confirmed",
             "assists are estimated from pass actions; receiver score linkage is not detected yet",
             "block actions are emitted as event candidates and are not counted as official blocks without ball/rim/shot confirmation",
         ]
+        if shots:
+            notes.append(f"{shots} shoot-classified clips are available as point_candidate evidence")
         if block_candidates:
             notes.append(f"{block_candidates} block-classified clips are available as block_candidate evidence")
         if rebounds == 0:
@@ -1844,15 +1984,17 @@ class AnalysisService:
         if steals == 0:
             notes.append("steals require possession-change and ball-touch confirmation")
         return PlayerBoxScoreEstimateResponse(
-            points=shots * 2,
+            points=0,
+            shot_attempts=shots,
+            point_candidate_count=shots,
             assists=passes,
             rebounds=rebounds,
             blocks=0,
             steals=steals,
             confidence=0.35 if (shots or passes or block_candidates or rebounds or steals) else 0.15,
             status="estimate_requires_event_confirmation",
-            estimated_fields=["points", "assists"],
-            candidate_fields=["rebounds", "blocks", "steals"],
+            estimated_fields=["assists"],
+            candidate_fields=["points", "rebounds", "blocks", "steals"],
             notes=notes,
         )
 

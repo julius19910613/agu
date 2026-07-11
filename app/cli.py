@@ -27,7 +27,12 @@ PRESETS: dict[str, dict[str, Any]] = {
         "vlm_mode": "low-confidence",
         "generate_video": False,
         "segmented_analysis": True,
+        "segment_duration_sec": 30.0,
+        "segment_overlap_sec": 3.0,
         "vlm_audit": True,
+        "vlm_audit_frames": 4,
+        "scoreboard_audit": True,
+        "scoreboard_audit_max_frames": 4,
         "tracking_fps": 12.0,
         "yolo_imgsz": 640,
         "action_vid_stride": 12,
@@ -39,7 +44,12 @@ PRESETS: dict[str, dict[str, Any]] = {
         "vlm_mode": "always",
         "generate_video": False,
         "segmented_analysis": True,
+        "segment_duration_sec": 30.0,
+        "segment_overlap_sec": 3.0,
         "vlm_audit": True,
+        "vlm_audit_frames": 4,
+        "scoreboard_audit": True,
+        "scoreboard_audit_max_frames": 4,
         "tracking_fps": 12.0,
         "yolo_imgsz": 640,
         "action_vid_stride": 12,
@@ -89,6 +99,7 @@ def _print_status_summary(payload: dict[str, Any]) -> None:
         "segment_count": len(long_video.get("segments") or []),
         "player_count": len(long_video.get("players") or []),
         "audit_summary": long_video.get("audit_summary"),
+        "scoreboard_summary": long_video.get("scoreboard_summary"),
     }
     _print_json({key: value for key, value in compact.items() if value is not None})
 
@@ -109,6 +120,9 @@ def _apply_preset(args: argparse.Namespace) -> dict[str, Any]:
         "max_segments": args.max_segments,
         "vlm_audit": args.vlm_audit,
         "vlm_audit_frames": args.vlm_audit_frames,
+        "scoreboard_audit": args.scoreboard_audit,
+        "scoreboard_audit_interval_sec": args.scoreboard_audit_interval_sec,
+        "scoreboard_audit_max_frames": args.scoreboard_audit_max_frames,
         "vlm_identity_merge_enabled": args.vlm_identity_merge_enabled,
         "tracker_backend": args.tracker_backend,
         "tracker_conf_thres": args.tracker_conf_thres,
@@ -243,6 +257,9 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("--max-segments", type=int)
     analyze_parser.add_argument("--vlm-audit", action=argparse.BooleanOptionalAction, default=None)
     analyze_parser.add_argument("--vlm-audit-frames", type=int)
+    analyze_parser.add_argument("--scoreboard-audit", action=argparse.BooleanOptionalAction, default=None)
+    analyze_parser.add_argument("--scoreboard-audit-interval-sec", type=float)
+    analyze_parser.add_argument("--scoreboard-audit-max-frames", type=int)
     analyze_parser.add_argument("--vlm-identity-merge-enabled", action=argparse.BooleanOptionalAction, default=None)
     analyze_parser.add_argument("--tracker-backend", choices=["bytetrack", "botsort", "custom"])
     analyze_parser.add_argument("--tracker-conf-thres", type=float)

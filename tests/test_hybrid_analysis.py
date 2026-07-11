@@ -25,7 +25,12 @@ from app.analysis.schemas import (
     VLMVideoAuditResponse,
 )
 from app.analysis.service import AnalysisService
-from app.analysis.vlm import extract_json_object, normalize_action
+from app.analysis.vlm import (
+    _last_visible_scoreboard,
+    _parse_scoreboard_checkpoints,
+    extract_json_object,
+    normalize_action,
+)
 from app.analysis.fusion import fuse_decision, should_call_vlm, apply_temporal_smoothing
 from app.analysis.tracking import crop_windows, resolve_yolo_tracker_config, select_active_track_ids
 from scripts.build_identity_duplicate_report import build_duplicate_report
@@ -242,10 +247,12 @@ class HybridAnalysisTest(unittest.TestCase):
     def test_block_actions_are_not_counted_as_official_blocks(self):
         service = self.make_service()
         stats = service._estimate_player_statistics(Counter({"block": 5, "shoot": 1}))
-        self.assertEqual(stats.points, 2)
+        self.assertEqual(stats.points, 0)
+        self.assertEqual(stats.shot_attempts, 1)
+        self.assertEqual(stats.point_candidate_count, 1)
         self.assertEqual(stats.blocks, 0)
         self.assertEqual(stats.status, "estimate_requires_event_confirmation")
-        self.assertIn("points", stats.estimated_fields)
+        self.assertIn("points", stats.candidate_fields)
         self.assertIn("blocks", stats.candidate_fields)
         self.assertTrue(any("block_candidate" in note for note in stats.notes))
 
@@ -365,7 +372,9 @@ class HybridAnalysisTest(unittest.TestCase):
         self.assertEqual(merged[0].segments_seen, 2)
         self.assertEqual(merged[0].clip_count, 7)
         self.assertEqual(merged[0].action_counts["shoot"], 3)
-        self.assertEqual(merged[0].statistics.points, 6)
+        self.assertEqual(merged[0].statistics.points, 0)
+        self.assertEqual(merged[0].statistics.shot_attempts, 3)
+        self.assertEqual(merged[0].statistics.point_candidate_count, 3)
         self.assertEqual(merged[0].statistics.assists, 1)
         self.assertEqual(merged[0].statistics.rebounds, 1)
         self.assertEqual(merged[0].statistics.steals, 1)
@@ -1742,13 +1751,35 @@ class HybridAnalysisTest(unittest.TestCase):
         service = AnalysisService(settings=Settings(), model=MagicMock(), device="cpu")
         stats = service._estimate_player_statistics(Counter({"shoot": 2, "pass": 3, "block": 1}))
 
-        self.assertEqual(stats.points, 4)
+        self.assertEqual(stats.points, 0)
+        self.assertEqual(stats.shot_attempts, 2)
+        self.assertEqual(stats.point_candidate_count, 2)
         self.assertEqual(stats.assists, 3)
         self.assertEqual(stats.blocks, 0)
         self.assertEqual(stats.status, "estimate_requires_event_confirmation")
+        self.assertIn("points", stats.candidate_fields)
         self.assertTrue(any("block_candidate" in note for note in stats.notes))
         self.assertEqual(stats.rebounds, 0)
         self.assertEqual(stats.steals, 0)
+
+    def test_scoreboard_parser_uses_latest_readable_checkpoint(self):
+        checkpoints = _parse_scoreboard_checkpoints(
+            [
+                {"index": 0, "visible": True, "left_score": 0, "right_score": 0, "confidence": 0.9},
+                {"index": 1, "visible": False, "confidence": 0.1},
+                {"index": 2, "visible": True, "left_score": 10, "right_score": 6, "confidence": 0.8},
+            ],
+            frame_times=[90.0, 600.0, 1020.0],
+            frame_numbers=[2700, 18000, 30600],
+            raw_response="{}",
+        )
+
+        final = _last_visible_scoreboard(checkpoints)
+
+        self.assertIsNotNone(final)
+        self.assertEqual(final.left_score, 10)
+        self.assertEqual(final.right_score, 6)
+        self.assertEqual(final.time_sec, 1020.0)
 
     def test_identity_graph_summary_counts_review_nodes(self):
         service = self.make_service()

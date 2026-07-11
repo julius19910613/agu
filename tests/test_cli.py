@@ -22,6 +22,11 @@ def test_analyze_preset_builds_accurate_payload(monkeypatch, capsys) -> None:
     assert captured["payload"]["vlm_mode"] == "low-confidence"
     assert captured["payload"]["tracker_backend"] == "botsort"
     assert captured["payload"]["yolo_reid_enabled"] is True
+    assert captured["payload"]["segment_duration_sec"] == 30.0
+    assert captured["payload"]["segment_overlap_sec"] == 3.0
+    assert captured["payload"]["vlm_audit_frames"] == 4
+    assert captured["payload"]["scoreboard_audit"] is True
+    assert captured["payload"]["scoreboard_audit_max_frames"] == 4
     assert "task-1" in capsys.readouterr().out
 
 

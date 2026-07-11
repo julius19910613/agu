@@ -90,10 +90,11 @@ basketball video -> player tracks -> action clips -> structured JSON + optional 
   - `BASKETBALL_MAX_PLAYERS_PER_SEGMENT=12` 保留出现最稳定的球员轨迹，避免噪声 track 放大推理量。
 - 球员技术统计估算：
   - `statistics.points`、`assists`、`rebounds`、`blocks`、`steals`。
-  - 当前为 `action_proxy_v1`，不是正式技术统计；points 来自 `shoot`，assists 来自 `pass`。
-  - `statistics.status`、`estimated_fields`、`candidate_fields` 会标出哪些字段只是估算、哪些字段仍需事件确认。
+  - 当前为 `action_proxy_v1`，不是正式技术统计；`shoot` 会进入 `shot_attempts` / `point_candidate_count`，不会在未确认命中前直接写入正式 `points`。
+  - `statistics.status`、`estimated_fields`、`candidate_fields` 会标出哪些字段只是估算、哪些字段仍需事件确认；`points` 需要命中、罚球或比分牌/事件链路确认。
   - `block` 不再直接计入正式 `statistics.blocks`；会先输出 `block_candidate`，等待球/篮筐/投篮或 VLM 确认。
   - `rebound_candidate` 和 `steal_candidate` 由简化球权状态线索生成，仍需球检测、篮筐检测或 VLM/人工确认。
+  - `accurate` / `vlm-full` CLI preset 会默认开启 `scoreboard_audit`，在 `long_video.scoreboard_summary` 输出 VLM 读取的比分牌 checkpoint 和最终可读比分，用于和动作统计对账。
 - 输出文件：
   - JSON：`analysis_outputs/*.json`
   - 视频：`output_videos/*.mp4`
@@ -175,7 +176,7 @@ CLI 常用 preset：
 | Preset | 用途 | 说明 |
 | --- | --- | --- |
 | `fast` | 快速冒烟 | 关闭 VLM audit，降低跟踪成本 |
-| `accurate` | 常规准确率优先 | 开启低置信 VLM、VLM audit、BoT-SORT/ReID 和更高跟踪召回 |
+| `accurate` | 常规准确率优先 | 开启低置信 VLM、VLM audit、BoT-SORT/ReID、更高跟踪召回和 scoreboard audit；默认使用 30s segment / 3s overlap / 4 张 segment audit 帧 / 4 张 scoreboard 样本降低全片重复计算 |
 | `vlm-full` | 全程 VLM 复核 | 在 `accurate` 基础上使用 `vlm_mode=always` 并启用 VLM identity merge |
 
 生成球员截图、证据视频和 roster 汇总：
@@ -545,7 +546,8 @@ Current identity and statistics behavior:
 - `long_video.identity_duplicate_candidates[]` exposes review-only duplicate-ID merge candidates and does not rewrite statistics automatically.
 - `long_video.identity_merge_decisions[]` exposes optional VLM post-processing decisions when `vlm_identity_merge_enabled=true`.
 - `long_video.merged_players[]` exposes confirmed-merge statistics when `confirmed_identity_merges[]` is supplied in the request.
-- `statistics.points`, `assists`, `rebounds`, `blocks`, and `steals` are action-proxy estimates, not official box-score truth. The `statistics.status`, `estimated_fields`, and `candidate_fields` fields make that contract explicit. Block, rebound, and steal evidence should be confirmed through event candidates, owner candidates, ball/rim/possession evidence, VLM, or human review.
+- `statistics.points`, `assists`, `rebounds`, `blocks`, and `steals` are action-proxy estimates, not official box-score truth. `shoot` clips are exposed as `shot_attempts` and `point_candidate_count`; `points` remains 0 until made-shot, free-throw, or scoreboard-linked scoring confirmation exists. The `statistics.status`, `estimated_fields`, and `candidate_fields` fields make that contract explicit. Block, rebound, steal, and point evidence should be confirmed through event candidates, owner candidates, ball/rim/possession evidence, VLM, scoreboard audit, or human review.
+- `long_video.scoreboard_summary` is emitted when `scoreboard_audit=true`; CLI `accurate` and `vlm-full` enable it by default.
 
 Setup:
 
