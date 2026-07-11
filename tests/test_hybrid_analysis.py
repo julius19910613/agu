@@ -22,6 +22,7 @@ from app.analysis.schemas import (
     PlayerIdentityFeatureResponse,
     VLMDecisionResponse,
     VLMIdentityMergeDecisionResponse,
+    VLMVideoAuditResponse,
 )
 from app.analysis.service import AnalysisService
 from app.analysis.vlm import extract_json_object, normalize_action
@@ -283,6 +284,38 @@ class HybridAnalysisTest(unittest.TestCase):
         ]
 
         candidates = service._detect_event_candidates(records)
+
+        self.assertTrue(any(candidate.event_type == "block_candidate" for candidate in candidates))
+
+    def test_vlm_audit_without_block_suppresses_block_candidate(self):
+        service = self.make_service()
+        records = [
+            self.make_record(1, "block", 10, 25, confidence=0.82),
+            self.make_record(1, "block", 30, 45, confidence=0.78),
+        ]
+        audit = VLMVideoAuditResponse(
+            available=True,
+            actions=["dribble", "defense", "ball in hand"],
+            confidence=0.75,
+        )
+
+        candidates = service._detect_event_candidates(records, segment_audits={0: audit})
+
+        self.assertFalse(any(candidate.event_type == "block_candidate" for candidate in candidates))
+
+    def test_vlm_audit_with_block_keeps_block_candidate(self):
+        service = self.make_service()
+        records = [
+            self.make_record(1, "block", 10, 25, confidence=0.82),
+            self.make_record(1, "block", 30, 45, confidence=0.78),
+        ]
+        audit = VLMVideoAuditResponse(
+            available=True,
+            actions=["block", "defense"],
+            confidence=0.75,
+        )
+
+        candidates = service._detect_event_candidates(records, segment_audits={0: audit})
 
         self.assertTrue(any(candidate.event_type == "block_candidate" for candidate in candidates))
 

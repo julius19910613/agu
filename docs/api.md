@@ -323,6 +323,12 @@ is promoted only when its average confidence is high enough; otherwise AGU keeps
 the action record but does not expose it as an event candidate. This avoids
 turning isolated R(2+1)D block noise into a box-score event.
 
+When segment VLM audit is available with confident action evidence, AGU also uses
+it as negative evidence for `block_candidate`: if the audit does not include a
+visible block, block candidates from that segment are suppressed. The underlying
+clip-level `records[]` and `summary.action_counts` remain unchanged so reviewers
+can still inspect model disagreements.
+
 Each `owner_candidates[]` item contains:
 
 | Field | Type | Meaning |

@@ -578,7 +578,14 @@ class AnalysisService:
             )
             for record in merged_records
         ]
-        event_candidates = self._detect_event_candidates(merged_records)
+        event_candidates = self._detect_event_candidates(
+            merged_records,
+            segment_audits={
+                segment.segment_id: segment.vlm_audit
+                for segment in segment_outputs
+                if segment.vlm_audit is not None
+            },
+        )
 
         audit_summary = LongVideoAuditSummaryResponse(
             total_segments=len(segment_outputs),
@@ -1564,6 +1571,7 @@ class AnalysisService:
     def _detect_event_candidates(
         self,
         records: List[AnalysisRecordResponse],
+        segment_audits: Optional[Dict[int, VLMVideoAuditResponse]] = None,
     ) -> List[EventCandidateResponse]:
         """Detect low/medium confidence basketball event candidates from action records."""
         sorted_records = sorted(records, key=lambda record: (int(record.start_frame), int(record.player)))
@@ -1572,11 +1580,31 @@ class AnalysisService:
         candidates.extend(self._detect_rebound_candidates(sorted_records))
         candidates.extend(self._detect_steal_candidates(sorted_records))
         candidates = [
+            candidate
+            for candidate in candidates
+            if self._event_candidate_supported_by_vlm_audit(candidate, segment_audits or {})
+        ]
+        candidates = [
             self._attach_event_owner_candidates(candidate, sorted_records)
             for candidate in candidates
         ]
         candidates.sort(key=lambda event: (event.start_frame, event.event_type, event.player_id or ""))
         return candidates[:500]
+
+    def _event_candidate_supported_by_vlm_audit(
+        self,
+        candidate: EventCandidateResponse,
+        segment_audits: Dict[int, VLMVideoAuditResponse],
+    ) -> bool:
+        if candidate.event_type != "block_candidate" or candidate.segment_id is None:
+            return True
+        audit = segment_audits.get(candidate.segment_id)
+        if audit is None or not audit.available or float(audit.confidence) < 0.60:
+            return True
+        audit_actions = {str(action).strip().lower().replace("_", " ") for action in audit.actions}
+        if "block" in audit_actions:
+            return True
+        return False
 
     def _attach_event_owner_candidates(
         self,
