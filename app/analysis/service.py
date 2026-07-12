@@ -31,6 +31,7 @@ from app.analysis.schemas import (
     IdentityDuplicateCandidateResponse,
     PlayerIdentityFeatureResponse,
     PlayerBoxScoreEstimateResponse,
+    ScoreboardCheckpointResponse,
     ScoreboardSummaryResponse,
     Size2D,
     VLMIdentityMergeDecisionResponse,
@@ -1059,12 +1060,53 @@ class AnalysisService:
         self._log_progress(
             f"Scoreboard audit start: samples={len(frames)}, duration={duration_sec:.1f}s."
         )
-        summary = verifier.audit_scoreboard_frames(
-            frames=frames,
-            frame_times=times,
-            frame_numbers=frame_numbers,
-            scope=f"full_video duration={duration_sec:.1f}s",
-        )
+        checkpoints: List[ScoreboardCheckpointResponse] = []
+        audit_statuses: List[str] = []
+        for frame, time_sec, frame_number in zip(frames, times, frame_numbers):
+            audit = verifier.audit_scoreboard_frames(
+                frames=[frame],
+                frame_times=[time_sec],
+                frame_numbers=[frame_number],
+                scope=f"full_video duration={duration_sec:.1f}s; independent burst evidence",
+            )
+            checkpoints.extend(audit.checkpoints)
+            audit_statuses.append(audit.status)
+        summary = self._reconcile_scoreboard_checkpoints(checkpoints)
+        if summary.status == "inconsistent_scoreboard":
+            conflict = self._latest_scoreboard_conflict(checkpoints)
+            if conflict is not None:
+                conflict_time, candidate_pairs = conflict
+                matching_indices = [
+                    index for index, time_sec in enumerate(times) if round(time_sec, 1) == conflict_time
+                ]
+                if matching_indices:
+                    adjudication_index = matching_indices[-1]
+                    candidate_text = ", ".join(f"{left}-{right}" for left, right in candidate_pairs)
+                    adjudication = verifier.audit_scoreboard_frames(
+                        frames=[frames[adjudication_index]],
+                        frame_times=[times[adjudication_index]],
+                        frame_numbers=[frame_numbers[adjudication_index]],
+                        scope=(
+                            "conflict adjudication on the stable 75th-percentile burst fusion. "
+                            f"Independent candidate score pairs are {candidate_text}. "
+                            "Choose only a visibly supported candidate pair. Compare differing LED segments carefully."
+                        ),
+                    )
+                    supported = [
+                        checkpoint
+                        for checkpoint in adjudication.checkpoints
+                        if (checkpoint.left_score, checkpoint.right_score) in candidate_pairs
+                        and checkpoint.confidence >= 0.8
+                    ]
+                    checkpoints.extend(supported)
+                    summary = self._reconcile_scoreboard_checkpoints(checkpoints)
+        if not checkpoints and audit_statuses:
+            summary = summary.model_copy(
+                update={
+                    "status": audit_statuses[-1],
+                    "notes": ["Scoreboard candidate audits did not return any checkpoints."],
+                }
+            )
         self._log_progress(
             "Scoreboard audit done: "
             f"status={summary.status}, final={summary.final_left_score}-{summary.final_right_score}."
@@ -1082,33 +1124,7 @@ class AnalysisService:
     ) -> tuple[List[np.ndarray], List[float], List[int]]:
         max_frames = max(1, int(max_frames or 1))
         duration_sec = max(0.0, float(duration_sec))
-        interval_sec = max(30.0, float(interval_sec or 120.0))
-        candidates = [0.0, min(60.0, duration_sec), min(90.0, duration_sec), min(120.0, duration_sec)]
-        t = interval_sec
-        while t < max(0.0, duration_sec - 30.0):
-            candidates.append(t)
-            t += interval_sec
-        candidates.extend(
-            [
-                max(0.0, duration_sec - 60.0),
-                max(0.0, duration_sec - 30.0),
-                max(0.0, duration_sec - 15.0),
-                max(0.0, duration_sec - 5.0),
-            ]
-        )
-        unique_times = sorted({round(min(max(0.0, value), duration_sec), 2) for value in candidates})
-        if len(unique_times) > max_frames:
-            head_count = max(1, max_frames // 3)
-            tail_count = max(2, max_frames // 3)
-            middle_count = max_frames - head_count - tail_count
-            middle = unique_times[head_count : len(unique_times) - tail_count]
-            if middle_count > 0 and middle:
-                indices = np.linspace(0, len(middle) - 1, middle_count, dtype=int)
-                selected_middle = [middle[int(index)] for index in indices]
-            else:
-                selected_middle = []
-            unique_times = unique_times[:head_count] + selected_middle + unique_times[-tail_count:]
-
+        scan_step = min(max(1.0, float(interval_sec or 120.0) / 20.0), max(0.5, duration_sec / 320.0))
         cap = cv2.VideoCapture(video_path)
         frames: List[np.ndarray] = []
         times: List[float] = []
@@ -1116,47 +1132,312 @@ class AnalysisService:
         try:
             if not cap.isOpened():
                 return frames, times, frame_numbers
-            for index, time_sec in enumerate(unique_times):
+            scan_times = np.arange(0.0, max(duration_sec, 0.01), scan_step).tolist()
+            if duration_sec > 0:
+                scan_times.append(max(0.0, duration_sec - min(0.5, duration_sec)))
+            candidates: List[Dict[str, Any]] = []
+            for time_sec in scan_times:
                 frame_number = min(max(0, int(round(time_sec * fps))), max(0, frame_count - 1))
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     continue
-                frames.append(self._make_scoreboard_review_image(frame, sample_index=index, time_sec=time_sec))
-                times.append(float(time_sec))
-                frame_numbers.append(int(frame_number))
+                score, box = self._score_scoreboard_candidate(frame)
+                if box is not None:
+                    candidates.append({"time_sec": float(time_sec), "score": float(score), "box": box})
+
+            selected = self._select_scoreboard_candidates(candidates, max_frames=max_frames)
+            for candidate in selected:
+                variants = self._build_scoreboard_burst_variants(
+                    cap=cap,
+                    anchor_time_sec=float(candidate["time_sec"]),
+                    fps=fps,
+                    frame_count=frame_count,
+                )
+                for variant, variant_time, variant_frame in variants:
+                    frames.append(variant)
+                    times.append(variant_time)
+                    frame_numbers.append(variant_frame)
         finally:
             cap.release()
         return frames, times, frame_numbers
 
-    def _make_scoreboard_review_image(
+    def _score_scoreboard_candidate(
         self,
         frame: np.ndarray,
-        sample_index: int,
-        time_sec: float,
+    ) -> tuple[float, Optional[tuple[int, int, int, int]]]:
+        height, width = frame.shape[:2]
+        target_width = 640
+        scale = target_width / max(1, width)
+        resized = cv2.resize(frame, (target_width, max(1, int(height * scale))), interpolation=cv2.INTER_AREA)
+        hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
+        hue, saturation, value = cv2.split(hsv)
+        red = (((hue < 12) | (hue > 170)) & (saturation > 90) & (value > 130)).astype(np.float32)
+        yellow = ((hue >= 12) & (hue < 42) & (saturation > 90) & (value > 130)).astype(np.float32)
+        green = ((hue >= 42) & (hue < 110) & (saturation > 60) & (value > 120)).astype(np.float32)
+        led = np.maximum.reduce([red, yellow, green])
+        dark = (value < 135).astype(np.float32)
+
+        best_score = 0.0
+        best_box: Optional[tuple[int, int, int, int]] = None
+        resized_height, resized_width = resized.shape[:2]
+        for window_width, window_height in ((96, 48), (128, 64), (160, 80)):
+            area = float(window_width * window_height)
+            led_sum = cv2.boxFilter(led, -1, (window_width, window_height), normalize=False)
+            dark_ratio = cv2.boxFilter(dark, -1, (window_width, window_height), normalize=False) / area
+            color_count = sum(
+                cv2.boxFilter(mask, -1, (window_width, window_height), normalize=False) >= 4
+                for mask in (red, yellow, green)
+            )
+            score_map = led_sum * (0.4 + dark_ratio) * (1.0 + 0.35 * np.maximum(0, color_count - 1))
+            score_map[: min(32, resized_height), :] = 0
+            score_map[max(0, resized_height - 32) :, :] = 0
+            _, max_value, _, max_location = cv2.minMaxLoc(score_map)
+            if max_value <= best_score:
+                continue
+            center_x, center_y = max_location
+            x = max(0, min(resized_width - window_width, center_x - window_width // 2))
+            y = max(0, min(resized_height - window_height, center_y - window_height // 2))
+            inverse_scale = 1.0 / scale
+            best_score = float(max_value)
+            best_box = (
+                int(round(x * inverse_scale)),
+                int(round(y * inverse_scale)),
+                int(round(window_width * inverse_scale)),
+                int(round(window_height * inverse_scale)),
+            )
+        if best_score < 150.0:
+            return 0.0, None
+        return best_score, best_box
+
+    def _select_scoreboard_candidates(
+        self,
+        candidates: List[Dict[str, Any]],
+        max_frames: int,
+    ) -> List[Dict[str, Any]]:
+        if not candidates:
+            return []
+        eligible = [candidate for candidate in candidates if float(candidate["score"]) >= 150.0]
+        selected: List[Dict[str, Any]] = []
+        for candidate in sorted(eligible, key=lambda item: float(item["time_sec"]), reverse=True):
+            if all(abs(float(candidate["time_sec"]) - float(item["time_sec"])) >= 3.0 for item in selected):
+                selected.append(candidate)
+                if len(selected) >= max_frames:
+                    break
+        if len(selected) < max_frames:
+            for candidate in sorted(candidates, key=lambda item: float(item["score"]), reverse=True):
+                if candidate in selected:
+                    continue
+                if all(abs(float(candidate["time_sec"]) - float(item["time_sec"])) >= 2.0 for item in selected):
+                    selected.append(candidate)
+                    if len(selected) >= max_frames:
+                        break
+        return sorted(selected, key=lambda item: float(item["time_sec"]))
+
+    def _build_scoreboard_burst_variants(
+        self,
+        cap: cv2.VideoCapture,
+        anchor_time_sec: float,
+        fps: float,
+        frame_count: int,
+    ) -> List[tuple[np.ndarray, float, int]]:
+        burst: List[tuple[float, int, float, tuple[int, int, int, int], np.ndarray]] = []
+        for offset in (-0.4, -0.2, 0.0, 0.2, 0.4):
+            time_sec = max(0.0, anchor_time_sec + offset)
+            frame_number = min(max(0, int(round(time_sec * fps))), max(0, frame_count - 1))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            score, box = self._score_scoreboard_candidate(frame)
+            if box is not None:
+                burst.append((score, frame_number, time_sec, box, frame))
+        if not burst:
+            return []
+
+        burst.sort(key=lambda item: item[0], reverse=True)
+        best = burst[0]
+        best_center = (best[3][0] + best[3][2] / 2.0, best[3][1] + best[3][3] / 2.0)
+        aligned = [
+            item
+            for item in burst
+            if abs((item[3][0] + item[3][2] / 2.0) - best_center[0]) <= item[4].shape[1] * 0.14
+            and abs((item[3][1] + item[3][3] / 2.0) - best_center[1]) <= item[4].shape[0] * 0.14
+            and item[0] >= best[0] * 0.3
+        ]
+        sharp = aligned[:1] if aligned else burst[:1]
+        variants: List[tuple[np.ndarray, float, int]] = []
+        anchor_time = float(best[2])
+        anchor_frame = int(best[1])
+        for _, _, _, box, frame in sharp:
+            crop = self._crop_scoreboard_panel(frame, box)
+            normalized = cv2.resize(crop, (1200, 420), interpolation=cv2.INTER_CUBIC)
+            variants.append((normalized, anchor_time, anchor_frame))
+        fusion_source = sorted(aligned if len(aligned) >= 3 else burst, key=lambda item: item[2])
+        fusion_crops = [
+            cv2.resize(self._crop_scoreboard_panel(item[4], item[3]), (1200, 420), interpolation=cv2.INTER_CUBIC)
+            for item in fusion_source
+        ]
+        if fusion_crops:
+            stacked = np.stack(fusion_crops)
+            stable_fusion = np.percentile(stacked, 65, axis=0).astype(np.uint8)
+            percentile_fusion = np.percentile(stacked, 75, axis=0).astype(np.uint8)
+            variants.append((stable_fusion, anchor_time, anchor_frame))
+            variants.append((percentile_fusion, anchor_time, anchor_frame))
+        return variants
+
+    def _crop_scoreboard_panel(
+        self,
+        frame: np.ndarray,
+        box: tuple[int, int, int, int],
     ) -> np.ndarray:
         height, width = frame.shape[:2]
-        target_width = 960
-        scale = target_width / max(1, width)
-        full = cv2.resize(frame, (target_width, max(1, int(height * scale))), interpolation=cv2.INTER_AREA)
-        upper = frame[: max(1, int(height * 0.45)), :]
-        upper = cv2.resize(upper, (target_width, max(1, int(upper.shape[0] * scale * 1.8))), interpolation=cv2.INTER_CUBIC)
-        label_h = 44
-        canvas = np.zeros((label_h + full.shape[0] + upper.shape[0], target_width, 3), dtype=np.uint8)
-        canvas[:label_h, :] = (20, 20, 20)
-        cv2.putText(
-            canvas,
-            f"SAMPLE {sample_index}  t={time_sec:.1f}s",
-            (18, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
+        x, y, box_width, box_height = box
+        center_x = x + box_width / 2.0
+        center_y = y + box_height / 2.0
+        crop_width = min(width, max(box_width * 2.0, width * 0.38))
+        crop_height = min(height, max(box_height * 1.8, crop_width / 2.4, height * 0.2))
+        left = int(round(center_x - crop_width / 2.0))
+        top = int(round(center_y - crop_height / 2.0))
+        left = max(0, min(width - int(crop_width), left))
+        top = max(0, min(height - int(crop_height), top))
+        return frame[top : top + int(crop_height), left : left + int(crop_width)]
+
+    def _reconcile_scoreboard_checkpoints(
+        self,
+        checkpoints: List[ScoreboardCheckpointResponse],
+    ) -> ScoreboardSummaryResponse:
+        readable = [
+            checkpoint
+            for checkpoint in checkpoints
+            if checkpoint.visible
+            and checkpoint.left_score is not None
+            and checkpoint.right_score is not None
+            and checkpoint.confidence >= 0.65
+        ]
+        grouped: Dict[float, List[ScoreboardCheckpointResponse]] = defaultdict(list)
+        for checkpoint in readable:
+            grouped[round(checkpoint.time_sec, 1)].append(checkpoint)
+
+        consensus: List[tuple[ScoreboardCheckpointResponse, int, float]] = []
+        notes: List[str] = []
+        for time_sec, group in sorted(grouped.items()):
+            pair_counts = Counter((item.left_score, item.right_score) for item in group)
+            pair, count = pair_counts.most_common(1)[0]
+            if count < 2:
+                continue
+            matches = [item for item in group if (item.left_score, item.right_score) == pair]
+            chosen = max(matches, key=lambda item: item.confidence)
+            average_confidence = sum(item.confidence for item in matches) / len(matches)
+            consensus.append((chosen, count, average_confidence))
+            notes.append(f"Burst consensus at t={time_sec:.1f}s: {pair[0]}-{pair[1]} from {count} reads.")
+
+        if not consensus:
+            status = "inconsistent_scoreboard" if readable else "no_readable_scoreboard"
+            notes.append(
+                "Readable scoreboard candidates did not reach two-read burst consensus."
+                if readable
+                else "No scoreboard candidate produced a high-confidence readable score."
+            )
+            return ScoreboardSummaryResponse(
+                enabled=True,
+                status=status,
+                method="vlm_scoreboard_burst_audit_v2",
+                checkpoints=checkpoints,
+                notes=notes,
+            )
+
+        consensus.sort(key=lambda item: item[0].time_sec)
+        qualities: List[float] = []
+        for index, (checkpoint, count, average_confidence) in enumerate(consensus):
+            clock_seconds = self._parse_scoreboard_clock(checkpoint.game_clock)
+            quality = count * 2.0 + average_confidence
+            quality += 0.75 if clock_seconds is not None else 0.0
+            quality += 0.25 if checkpoint.period else 0.0
+            if clock_seconds is not None:
+                for earlier, _, _ in consensus[:index]:
+                    earlier_clock = self._parse_scoreboard_clock(earlier.game_clock)
+                    same_period = not earlier.period or not checkpoint.period or earlier.period == checkpoint.period
+                    if same_period and earlier_clock is not None and clock_seconds > earlier_clock + 1.0:
+                        quality -= 1.5
+                        notes.append(
+                            f"Penalized t={checkpoint.time_sec:.1f}s because game clock increased "
+                            f"from {earlier_clock:.1f}s to {clock_seconds:.1f}s."
+                        )
+                        break
+            qualities.append(quality)
+
+        strongest_index = max(range(len(consensus)), key=lambda index: qualities[index])
+        final = consensus[strongest_index][0]
+        strongest_quality = qualities[strongest_index]
+        for index in range(strongest_index + 1, len(consensus)):
+            candidate = consensus[index][0]
+            non_decreasing = (
+                candidate.left_score >= final.left_score and candidate.right_score >= final.right_score
+            )
+            if non_decreasing:
+                final = candidate
+                continue
+            if abs(qualities[index] - strongest_quality) < 0.2:
+                notes.append("Rejected final score because equally supported cross-time consensuses conflict.")
+                return ScoreboardSummaryResponse(
+                    enabled=True,
+                    status="inconsistent_scoreboard",
+                    method="vlm_scoreboard_burst_audit_v2",
+                    checkpoints=checkpoints,
+                    notes=notes,
+                )
+            notes.append(
+                f"Ignored lower-quality non-monotonic consensus at t={candidate.time_sec:.1f}s: "
+                f"{candidate.left_score}-{candidate.right_score}."
+            )
+        return ScoreboardSummaryResponse(
+            enabled=True,
+            status="ok",
+            method="vlm_scoreboard_burst_audit_v2",
+            final_left_score=final.left_score,
+            final_right_score=final.right_score,
+            final_total_points=int(final.left_score) + int(final.right_score),
+            final_time_sec=final.time_sec,
+            checkpoints=checkpoints,
+            notes=notes,
         )
-        canvas[label_h : label_h + full.shape[0], :] = full
-        canvas[label_h + full.shape[0] :, :] = upper
-        return canvas
+
+    def _parse_scoreboard_clock(self, value: str) -> Optional[float]:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parts = text.split(":")
+            if len(parts) == 1:
+                return float(parts[0])
+            seconds = float(parts[-1])
+            minutes = float(parts[-2])
+            hours = float(parts[-3]) if len(parts) >= 3 else 0.0
+            return hours * 3600.0 + minutes * 60.0 + seconds
+        except ValueError:
+            return None
+
+    def _latest_scoreboard_conflict(
+        self,
+        checkpoints: List[ScoreboardCheckpointResponse],
+    ) -> Optional[tuple[float, List[tuple[int, int]]]]:
+        grouped: Dict[float, List[tuple[int, int]]] = defaultdict(list)
+        for checkpoint in checkpoints:
+            if (
+                checkpoint.visible
+                and checkpoint.left_score is not None
+                and checkpoint.right_score is not None
+                and checkpoint.confidence >= 0.65
+            ):
+                grouped[round(checkpoint.time_sec, 1)].append(
+                    (int(checkpoint.left_score), int(checkpoint.right_score))
+                )
+        for time_sec in sorted(grouped, reverse=True):
+            pairs = list(dict.fromkeys(grouped[time_sec]))
+            if len(pairs) >= 2:
+                return time_sec, pairs
+        return None
 
     def _read_video_metadata(self, video_path: str) -> Dict[str, float]:
         cap = cv2.VideoCapture(video_path)

@@ -322,8 +322,8 @@ class OllamaVLMVerifier:
         frame_numbers: Sequence[int],
         scope: str,
     ) -> ScoreboardSummaryResponse:
-        """Ask the VLM to read visible scoreboards from sampled full-frame images."""
-        images = encode_frames_jpeg(frames, max_width=max(768, int(self.image_width)))
+        """Ask the VLM to read scoreboard candidate crops."""
+        images = encode_frames_jpeg(frames, max_width=max(1200, int(self.image_width)))
         if not images:
             return ScoreboardSummaryResponse(
                 enabled=True,
@@ -373,8 +373,13 @@ class OllamaVLMVerifier:
                 notes=[f"VLM returned non-JSON scoreboard response: {exc}"],
             )
 
+        checkpoint_payload = parsed.get("checkpoints")
+        if not isinstance(checkpoint_payload, list) and (
+            parsed.get("left_score") is not None or parsed.get("right_score") is not None
+        ):
+            checkpoint_payload = [{**parsed, "index": 0}]
         checkpoints = _parse_scoreboard_checkpoints(
-            parsed.get("checkpoints"),
+            checkpoint_payload,
             frame_times=frame_times,
             frame_numbers=frame_numbers,
             raw_response=raw,
@@ -387,6 +392,7 @@ class OllamaVLMVerifier:
         return ScoreboardSummaryResponse(
             enabled=True,
             status=status,
+            method="vlm_scoreboard_burst_audit_v2",
             final_left_score=final.left_score if final else None,
             final_right_score=final.right_score if final else None,
             final_total_points=(
@@ -574,10 +580,14 @@ class OllamaVLMVerifier:
     def _build_scoreboard_prompt(self, frame_times: Sequence[float], scope: str) -> str:
         samples = ", ".join(f"{index}=t{time_sec:.1f}s" for index, time_sec in enumerate(frame_times))
         return (
-            "You are reading the physical basketball scoreboard from sampled full-frame images. "
-            "Each image is one sample in order; the sample index and timestamp are also printed on the image. "
+            "You are reading candidate crops of a physical basketball scoreboard. "
+            "Each image is one sample in order. A crop may be a sharp burst frame or a temporal LED fusion of the same board. "
             "Read only numbers that are visibly on the scoreboard. Do not infer a score from game action. "
-            "Two-digit scores are common; preserve the tens digit when it is visible, for example read 15 as 15, not 5. "
+            "The large green or cyan digits directly under the left team label (often A or A队) are left_score. "
+            "The large green or cyan digits directly under the right team label (often B or B队) are right_score. "
+            "Do not confuse the smaller central yellow game clock, period, timeout, or foul counters with either score. "
+            "Scores can have one, two, or three digits. Preserve every visible leading hundreds or tens digit, "
+            "for example read 120 as 120, never 20. "
             "If a scoreboard is not visible or too blurry for a sample, mark visible false and leave scores null. "
             "Return only compact JSON with key checkpoints. checkpoints must be an array of objects with keys: "
             "index, visible, left_score, right_score, period, game_clock, confidence, notes. "
@@ -664,6 +674,7 @@ def _parse_scoreboard_checkpoints(
             period=str(item.get("period") or "").strip() or None,
             game_clock=str(item.get("game_clock") or "").strip(),
             confidence=clamp_float(item.get("confidence"), 0.0, 1.0, default=0.0),
+            source="vlm_scoreboard_burst_audit_v2",
             notes=_string_list(item.get("notes")),
             raw_response=raw_response,
         )

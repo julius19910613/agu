@@ -259,11 +259,11 @@ contains sampled scoreboard checkpoints plus the latest readable final score:
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `enabled` | boolean | Whether scoreboard audit was requested |
-| `status` | string | `ok`, `disabled`, `no_readable_scoreboard`, or VLM/error status |
+| `status` | string | `ok`, `disabled`, `no_readable_scoreboard`, `inconsistent_scoreboard`, or VLM/error status |
 | `final_left_score` / `final_right_score` | integer or null | Latest readable left/right score |
 | `final_total_points` | integer or null | Sum of latest readable left/right score |
 | `final_time_sec` | number or null | Timestamp of the checkpoint used as final score |
-| `checkpoints[]` | array | Per-sample VLM scoreboard reads |
+| `checkpoints[]` | array | Independent VLM reads from OpenCV-ranked burst frames and temporal LED fusion crops |
 
 `result.long_video.identity_duplicate_candidates[]` contains conservative
 post-stitch duplicate-ID review candidates. These candidates do not rewrite

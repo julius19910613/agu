@@ -238,7 +238,7 @@ class ScoreboardCheckpointResponse(BaseModel):
     period: Optional[str] = None
     game_clock: str = ""
     confidence: float = 0.0
-    source: str = "vlm_scoreboard_audit_v1"
+    source: str = "vlm_scoreboard_burst_audit_v2"
     notes: List[str] = Field(default_factory=list)
     raw_response: str = ""
 
@@ -246,7 +246,7 @@ class ScoreboardCheckpointResponse(BaseModel):
 class ScoreboardSummaryResponse(BaseModel):
     enabled: bool = False
     status: str = "disabled"
-    method: str = "vlm_scoreboard_audit_v1"
+    method: str = "vlm_scoreboard_burst_audit_v2"
     final_left_score: Optional[int] = None
     final_right_score: Optional[int] = None
     final_total_points: Optional[int] = None

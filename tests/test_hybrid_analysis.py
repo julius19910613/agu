@@ -20,6 +20,7 @@ from app.analysis.schemas import (
     ModelPrediction,
     MotionFeatures,
     PlayerIdentityFeatureResponse,
+    ScoreboardCheckpointResponse,
     VLMDecisionResponse,
     VLMIdentityMergeDecisionResponse,
     VLMVideoAuditResponse,
@@ -1780,6 +1781,90 @@ class HybridAnalysisTest(unittest.TestCase):
         self.assertEqual(final.left_score, 10)
         self.assertEqual(final.right_score, 6)
         self.assertEqual(final.time_sec, 1020.0)
+
+    def test_scoreboard_candidate_scoring_prefers_led_panel(self):
+        service = self.make_service()
+        frame = np.full((360, 640, 3), 210, dtype=np.uint8)
+        cv2.rectangle(frame, (360, 130), (570, 230), (20, 20, 20), -1)
+        cv2.putText(frame, "120", (375, 195), cv2.FONT_HERSHEY_SIMPLEX, 1.8, (255, 255, 40), 5)
+        cv2.putText(frame, "96", (490, 195), cv2.FONT_HERSHEY_SIMPLEX, 1.8, (255, 255, 40), 5)
+        cv2.putText(frame, "Q4", (440, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 220, 255), 3)
+
+        score, box = service._score_scoreboard_candidate(frame)
+
+        self.assertGreater(score, 150.0)
+        self.assertIsNotNone(box)
+        self.assertGreater(box[0] + box[2], 350)
+
+    def test_scoreboard_candidate_selection_prefers_latest_diverse_times(self):
+        service = self.make_service()
+        candidates = [
+            {"time_sec": 10.0, "score": 900.0, "box": (0, 0, 10, 10)},
+            {"time_sec": 100.0, "score": 800.0, "box": (0, 0, 10, 10)},
+            {"time_sec": 101.0, "score": 790.0, "box": (0, 0, 10, 10)},
+            {"time_sec": 130.0, "score": 700.0, "box": (0, 0, 10, 10)},
+            {"time_sec": 145.0, "score": 650.0, "box": (0, 0, 10, 10)},
+        ]
+
+        selected = service._select_scoreboard_candidates(candidates, max_frames=3)
+
+        self.assertEqual([item["time_sec"] for item in selected], [101.0, 130.0, 145.0])
+
+    def test_scoreboard_reconciliation_accepts_burst_consensus(self):
+        service = self.make_service()
+        checkpoints = [
+            ScoreboardCheckpointResponse(time_sec=134.5, frame=4035, visible=True, left_score=120, right_score=96, confidence=0.95),
+            ScoreboardCheckpointResponse(time_sec=134.52, frame=4036, visible=True, left_score=120, right_score=96, confidence=0.90),
+            ScoreboardCheckpointResponse(time_sec=134.5, frame=4035, visible=True, left_score=20, right_score=19, confidence=0.80),
+        ]
+
+        summary = service._reconcile_scoreboard_checkpoints(checkpoints)
+
+        self.assertEqual(summary.status, "ok")
+        self.assertEqual(summary.final_left_score, 120)
+        self.assertEqual(summary.final_right_score, 96)
+        self.assertEqual(summary.final_total_points, 216)
+
+    def test_scoreboard_reconciliation_rejects_single_read_and_score_decrease(self):
+        service = self.make_service()
+        single = [
+            ScoreboardCheckpointResponse(time_sec=10.0, frame=300, visible=True, left_score=120, right_score=96, confidence=0.95),
+        ]
+        self.assertEqual(service._reconcile_scoreboard_checkpoints(single).status, "inconsistent_scoreboard")
+
+        decreasing = [
+            ScoreboardCheckpointResponse(time_sec=10.0, frame=300, visible=True, left_score=120, right_score=96, confidence=0.95, period="4", game_clock="3"),
+            ScoreboardCheckpointResponse(time_sec=10.02, frame=301, visible=True, left_score=120, right_score=96, confidence=0.90, period="4", game_clock="3"),
+            ScoreboardCheckpointResponse(time_sec=20.0, frame=600, visible=True, left_score=20, right_score=61, confidence=0.95, period="4", game_clock="3"),
+            ScoreboardCheckpointResponse(time_sec=20.02, frame=601, visible=True, left_score=20, right_score=61, confidence=0.90, period="4", game_clock="3"),
+        ]
+        self.assertEqual(service._reconcile_scoreboard_checkpoints(decreasing).status, "inconsistent_scoreboard")
+
+    def test_scoreboard_reconciliation_ignores_clock_increase_and_lower_quality_score(self):
+        service = self.make_service()
+        checkpoints = [
+            ScoreboardCheckpointResponse(time_sec=149.9, frame=4497, visible=True, left_score=120, right_score=96, confidence=0.95, period="4", game_clock="3"),
+            ScoreboardCheckpointResponse(time_sec=149.9, frame=4497, visible=True, left_score=120, right_score=96, confidence=0.90, period="4", game_clock="3"),
+            ScoreboardCheckpointResponse(time_sec=152.1, frame=4563, visible=True, left_score=97, right_score=96, confidence=0.85, period="4", game_clock="35"),
+            ScoreboardCheckpointResponse(time_sec=152.1, frame=4563, visible=True, left_score=97, right_score=96, confidence=0.80, period="4", game_clock="35"),
+        ]
+
+        summary = service._reconcile_scoreboard_checkpoints(checkpoints)
+
+        self.assertEqual(summary.status, "ok")
+        self.assertEqual((summary.final_left_score, summary.final_right_score), (120, 96))
+
+    def test_scoreboard_conflict_selects_latest_distinct_candidates(self):
+        service = self.make_service()
+        checkpoints = [
+            ScoreboardCheckpointResponse(time_sec=120.0, frame=3600, visible=True, left_score=118, right_score=94, confidence=0.9),
+            ScoreboardCheckpointResponse(time_sec=150.1, frame=4503, visible=True, left_score=120, right_score=98, confidence=0.95),
+            ScoreboardCheckpointResponse(time_sec=150.1, frame=4503, visible=True, left_score=120, right_score=96, confidence=0.95),
+        ]
+
+        conflict = service._latest_scoreboard_conflict(checkpoints)
+
+        self.assertEqual(conflict, (150.1, [(120, 98), (120, 96)]))
 
     def test_identity_graph_summary_counts_review_nodes(self):
         service = self.make_service()

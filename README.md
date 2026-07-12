@@ -94,7 +94,7 @@ basketball video -> player tracks -> action clips -> structured JSON + optional 
   - `statistics.status`、`estimated_fields`、`candidate_fields` 会标出哪些字段只是估算、哪些字段仍需事件确认；`points` 需要命中、罚球或比分牌/事件链路确认。
   - `block` 不再直接计入正式 `statistics.blocks`；会先输出 `block_candidate`，等待球/篮筐/投篮或 VLM 确认。
   - `rebound_candidate` 和 `steal_candidate` 由简化球权状态线索生成，仍需球检测、篮筐检测或 VLM/人工确认。
-  - `accurate` / `vlm-full` CLI preset 会默认开启 `scoreboard_audit`，在 `long_video.scoreboard_summary` 输出 VLM 读取的比分牌 checkpoint 和最终可读比分，用于和动作统计对账。
+  - `accurate` / `vlm-full` CLI preset 会默认开启 `scoreboard_audit`。审计会先用 OpenCV 搜索比分牌候选帧，再对候选时间进行 burst 采样，分别读取清晰帧和 LED 时序融合帧；只有同一时间至少两次读数一致且跨时间比分不下降时，才在 `long_video.scoreboard_summary` 输出最终比分。
 - 输出文件：
   - JSON：`analysis_outputs/*.json`
   - 视频：`output_videos/*.mp4`
@@ -547,7 +547,7 @@ Current identity and statistics behavior:
 - `long_video.identity_merge_decisions[]` exposes optional VLM post-processing decisions when `vlm_identity_merge_enabled=true`.
 - `long_video.merged_players[]` exposes confirmed-merge statistics when `confirmed_identity_merges[]` is supplied in the request.
 - `statistics.points`, `assists`, `rebounds`, `blocks`, and `steals` are action-proxy estimates, not official box-score truth. `shoot` clips are exposed as `shot_attempts` and `point_candidate_count`; `points` remains 0 until made-shot, free-throw, or scoreboard-linked scoring confirmation exists. The `statistics.status`, `estimated_fields`, and `candidate_fields` fields make that contract explicit. Block, rebound, steal, and point evidence should be confirmed through event candidates, owner candidates, ball/rim/possession evidence, VLM, scoreboard audit, or human review.
-- `long_video.scoreboard_summary` is emitted when `scoreboard_audit=true`; CLI `accurate` and `vlm-full` enable it by default.
+- `long_video.scoreboard_summary` is emitted when `scoreboard_audit=true`; CLI `accurate` and `vlm-full` enable it by default. The v2 audit ranks OpenCV scoreboard candidates, samples short bursts, reads sharp and temporally fused panel crops independently, and publishes a final score only after same-burst consensus and cross-time monotonicity checks. `inconsistent_scoreboard` means readable candidates disagreed and no final score was published.
 
 Setup:
 
