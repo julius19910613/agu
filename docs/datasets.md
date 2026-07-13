@@ -52,6 +52,12 @@ Recommended rules:
 - Avoid copyrighted broadcast clips unless redistribution is allowed.
 - Document the source of every sample video.
 
+`examples/benchmark/` is AGU's checked-in public contract fixture. It contains
+only authored JSON/CSV labels and predictions. A deterministic license-free MP4
+can be generated locally with `scripts/make_public_benchmark_fixture.py`; the
+generated video remains under ignored `analysis_outputs/`. This validates
+evaluation plumbing and must not be reported as model accuracy.
+
 ## Publishing Dataset References
 
 If you add a dataset reference, include:

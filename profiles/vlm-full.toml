@@ -1,0 +1,17 @@
+[analysis]
+vlm_mode = "always"
+generate_video = false
+segmented_analysis = true
+segment_duration_sec = 30.0
+segment_overlap_sec = 3.0
+vlm_audit = true
+vlm_audit_frames = 4
+scoreboard_audit = true
+scoreboard_audit_max_frames = 6
+tracking_fps = 12.0
+yolo_imgsz = 640
+action_vid_stride = 12
+max_players_per_segment = 18
+tracker_backend = "botsort"
+yolo_reid_enabled = true
+vlm_identity_merge_enabled = true

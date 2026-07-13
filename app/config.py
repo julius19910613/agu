@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     max_players_per_segment: int = 12
     torch_num_threads: int = 10
     progress_log: bool = True
+    analysis_timeout_sec: float = 0.0
     tracker_type: str = "YOLO"  # CSRT | YOLO
     tracker_backend: str = "bytetrack"  # bytetrack | botsort | custom
     yolo_tracker_config: str = ""
@@ -49,6 +50,11 @@ class Settings(BaseSettings):
     identity_embedding_device: str = "mps_if_available"
     identity_embedding_batch_size: int = 16
     identity_embedding_allow_fallback: bool = True
+    face_identity_backend: str = "opencv_sface_if_available"
+    face_detection_model_path: str = "model_checkpoints/opencv_face/face_detection_yunet_2023mar.onnx"
+    face_recognition_model_path: str = "model_checkpoints/opencv_face/face_recognition_sface_2021dec.onnx"
+    face_detection_score_threshold: float = 0.60
+    face_identity_allow_fallback: bool = True
     yolo_model_name: str = "yolov8n.pt"
     default_video: str = "examples/lebron_shoots.mp4"
 
@@ -57,6 +63,8 @@ class Settings(BaseSettings):
     ollama_model: str = "qwen3-vl:4b"
     ollama_host: str = "http://127.0.0.1:11434"
     ollama_timeout: float = 45.0
+    scoreboard_ocr_backend: str = "rapidocr_if_available"
+    scoreboard_ocr_confidence: float = 0.75
     vlm_frames: int = 1
     vlm_image_width: int = 224
     max_vlm_clips: int = 8
@@ -75,6 +83,7 @@ class Settings(BaseSettings):
     # --- Output directories ---
     output_dir: str = "analysis_outputs"
     video_output_dir: str = "output_videos"
+    allowed_video_roots: str = ""
 
     # --- Server ---
     host: str = "127.0.0.1"

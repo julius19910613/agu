@@ -36,6 +36,13 @@ Users are responsible for complying with the licenses of:
 - SpaceJam or any other dataset used for training.
 - Any external model checkpoints or VLM services.
 
+The maintained dependency/model/data matrix is in `THIRD_PARTY_NOTICES.md`.
+Generate a release-environment SBOM with:
+
+```bash
+python scripts/generate_sbom.py --output build/sbom.json
+```
+
 ## Dataset Policy
 
 AGU does not redistribute datasets. Training data must be obtained by users from the original dataset owners or official release channels.
@@ -98,3 +105,11 @@ Do not commit weight files into git. Use GitHub Releases, Hugging Face, object s
 - `dataset/`, `model_checkpoints/`, `analysis_outputs/`, and `output_videos/` are not committed.
 - `python scripts/smoke_open_source.py` passes.
 - `python scripts/verify_harness.py` passes.
+- `python scripts/evaluate_public_benchmark.py --strict` passes.
+- `python -m build` produces a wheel and sdist; an isolated wheel install runs
+  `agu --version` and `agu plugins doctor`.
+- GitHub CI passes on supported Python versions.
+- `THIRD_PARTY_NOTICES.md`, generated SBOM, `SECURITY.md`, `CHANGELOG.md`, and
+  `CITATION.cff` match the release.
+- Every shipped model/data artifact has source, license, checksum, and an
+  explicit redistribution decision.

@@ -1,0 +1,8 @@
+{
+  "schema_version": "1.0",
+  "scoreboard": {"left_score": 21, "right_score": 19},
+  "identity_pairs": [
+    {"left": "segment_000_player_001", "right": "segment_001_player_004", "same_player": true},
+    {"left": "segment_000_player_001", "right": "segment_001_player_006", "same_player": false}
+  ]
+}

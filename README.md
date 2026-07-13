@@ -7,7 +7,7 @@
 
 ### 项目简介
 
-AGU 是一个开源篮球视频动作理解引擎，组合了球员跟踪、片段级动作分类、简单运动特征、可选本地 VLM 复核和标注视频输出。
+AGU 是一个可扩展的开源篮球视频分析引擎与 reference pipeline，组合了球员跟踪、片段级动作分类、身份与衣服明暗证据、比分牌对账、可选本地 VLM 复核和标注视频输出。当前 0.x 定位是垂直领域 engine/toolkit，不宣称为通用视频 AI 框架。
 
 AGU 的目标不是成为小程序后端或完整篮球 SaaS，而是作为可被其他系统调用的分析引擎：
 
@@ -18,7 +18,7 @@ basketball video -> player tracks -> action clips -> structured JSON + optional 
 当前仓库提供：
 
 - 基于 FastAPI 的异步视频分析服务。
-- 轻量 CLI 客户端：`python -m app.cli`。
+- 可安装的 `agu-basketball` Python 包和 `agu` CLI；`python -m app.cli` 保持兼容。
 - Docker 自托管部署示例。
 - 面向 Mac/CPU/MPS 的训练入口 `train_mac.py`。
 - 兼容旧流程的脚本：`train.py`、`hybrid_analysis.py`、`hybrid_service.py`。
@@ -74,7 +74,7 @@ basketball video -> player tracks -> action clips -> structured JSON + optional 
   - `result.long_video.segments[]` 提供分段统计与 VLM audit 状态。
   - `result.player_identity_features[]` 提供局部轨迹模型 appearance embedding 和 continuity 特征。
   - 可选 `BASKETBALL_JERSEY_NUMBER_VLM_ENABLED=true` 后，`player_identity_features[].jersey_number_candidates[]` 会输出 VLM 读取到的球衣号码候选。
-  - `result.long_video.players[]` 提供 segment-local 球员动作汇总和 `appearance_continuity_stitch_v2` 的轻量 `global_player_id` 身份候选。
+  - `result.long_video.players[]` 提供 segment-local 球员动作汇总和 `appearance_continuity_stitch_v2` 的轻量 `global_player_id` 身份候选；身份证据包含整身 embedding、躯干球衣明暗，以及可见正脸的本地 OpenCV 检测/embedding 侧路。
   - `result.long_video.identity_duplicate_candidates[]` 提供疑似重复 `global_player_id` 的合并审核候选，不自动改写统计。
   - duplicate candidate 会使用采样 frame-level bbox 判断同屏硬冲突和重复框重叠。
   - 请求体可传 `confirmed_identity_merges[]`，确认后的聚合统计会输出到 `result.long_video.merged_players[]`，原始 `players[]` 不会被覆盖。
@@ -134,6 +134,17 @@ pip install -r requirements-service.txt
 cp .env.example .env
 ```
 
+框架开发或按能力安装：
+
+```bash
+pip install -e .
+pip install -e ".[api,inference]"
+pip install -e ".[tracking-ultralytics]"  # 单独复核 AGPL/商业许可边界
+pip install -e ".[ocr]"
+agu --version
+agu plugins doctor
+```
+
 启动 API：
 
 ```bash
@@ -154,10 +165,10 @@ curl -sS -X POST http://127.0.0.1:8765/api/v1/analysis/run \
   }'
 ```
 
-使用 CLI：
+使用 CLI（旧的 `python -m app.cli` 形式继续支持）：
 
 ```bash
-python -m app.cli analyze \
+agu analyze \
   --video examples/lebron_shoots.mp4 \
   --preset accurate \
   --poll \
@@ -168,15 +179,24 @@ python -m app.cli analyze \
 查询任务：
 
 ```bash
-python -m app.cli status <task_id>
+agu status <task_id>
 ```
+
+取消或重试任务：
+
+```bash
+agu cancel <task_id>
+agu retry <failed-or-cancelled-task-id>
+```
+
+取消、`max_runtime_sec` 截止时间均在 pipeline 进度边界协作生效；当前任务状态和原始请求保存在内存，服务重启后不提供恢复。
 
 CLI 常用 preset：
 
 | Preset | 用途 | 说明 |
 | --- | --- | --- |
 | `fast` | 快速冒烟 | 关闭 VLM audit，降低跟踪成本 |
-| `accurate` | 常规准确率优先 | 开启低置信 VLM、VLM audit、BoT-SORT/ReID、更高跟踪召回和 scoreboard audit；默认使用 30s segment / 3s overlap / 4 张 segment audit 帧 / 4 张 scoreboard 样本降低全片重复计算 |
+| `accurate` | 常规准确率优先 | 开启低置信 VLM、VLM audit、BoT-SORT/ReID、更高跟踪召回和 scoreboard audit；默认使用 30s segment / 3s overlap / 4 张 segment audit 帧 / 6 个质量与时序稳定性排序后的 scoreboard 候选 |
 | `vlm-full` | 全程 VLM 复核 | 在 `accurate` 基础上使用 `vlm_mode=always` 并启用 VLM identity merge |
 
 生成球员截图、证据视频和 roster 汇总：
@@ -203,6 +223,14 @@ python -m app.cli evaluate \
 ```
 
 CLI 准确率路线和每阶段架构 review 见 `docs/cli-accuracy-roadmap.md`。
+
+CLI 也可从 TOML/JSON/YAML profile 读取默认值，显式参数优先：
+
+```bash
+agu analyze --video examples/lebron_shoots.mp4 --profile profiles/accurate.toml
+```
+
+插件通过 `agu.plugins` Python entry point 注册，并声明类型、能力、依赖、版本和可用性。最小示例见 `examples/plugins/minimal_plugin.py`，完整约定见 `docs/extensions.md`。
 
 ### 目录结构
 
@@ -293,6 +321,7 @@ BASKETBALL_YOLO_IMGSZ=320
 BASKETBALL_MAX_PLAYERS_PER_SEGMENT=12
 BASKETBALL_TORCH_NUM_THREADS=10
 BASKETBALL_PROGRESS_LOG=true
+BASKETBALL_ANALYSIS_TIMEOUT_SEC=0.0
 BASKETBALL_TRACKER_TYPE=YOLO
 BASKETBALL_TRACKER_BACKEND=bytetrack
 BASKETBALL_YOLO_TRACKER_CONFIG=
@@ -303,10 +332,17 @@ BASKETBALL_IDENTITY_EMBEDDING_WEIGHTS=default
 BASKETBALL_IDENTITY_EMBEDDING_DEVICE=mps_if_available
 BASKETBALL_IDENTITY_EMBEDDING_BATCH_SIZE=16
 BASKETBALL_IDENTITY_EMBEDDING_ALLOW_FALLBACK=true
+BASKETBALL_FACE_IDENTITY_BACKEND=opencv_sface_if_available
+BASKETBALL_FACE_DETECTION_MODEL_PATH=model_checkpoints/opencv_face/face_detection_yunet_2023mar.onnx
+BASKETBALL_FACE_RECOGNITION_MODEL_PATH=model_checkpoints/opencv_face/face_recognition_sface_2021dec.onnx
+BASKETBALL_FACE_DETECTION_SCORE_THRESHOLD=0.60
+BASKETBALL_FACE_IDENTITY_ALLOW_FALLBACK=true
 BASKETBALL_VLM_MODE=low-confidence
 BASKETBALL_OLLAMA_MODEL=qwen3-vl:4b
 BASKETBALL_OLLAMA_HOST=http://127.0.0.1:11434
 BASKETBALL_OLLAMA_TIMEOUT=45.0
+BASKETBALL_SCOREBOARD_OCR_BACKEND=rapidocr_if_available
+BASKETBALL_SCOREBOARD_OCR_CONFIDENCE=0.75
 BASKETBALL_JERSEY_NUMBER_VLM_ENABLED=false
 BASKETBALL_JERSEY_NUMBER_VLM_FRAMES=2
 BASKETBALL_LOW_CONFIDENCE=0.45
@@ -317,6 +353,8 @@ BASKETBALL_VIDEO_OUTPUT_DIR=output_videos
 BASKETBALL_HOST=127.0.0.1
 BASKETBALL_PORT=8765
 ```
+
+球员面部身份默认使用 OpenCV YuNet + SFace 本地适配器。模型权重不进入仓库，分别放到上述两个配置路径；模型缺失时 `opencv_sface_if_available` 会回退到 Haar 检脸与通用外观特征，不影响服务启动。YuNet 与 SFace 可从 OpenCV Zoo 获取，运行时不需要联网。SFace 仅在同一轨迹至少两张脸形成占多数的一致聚类时输出，避免轨迹 ID 切换、背身或背景人物污染面部身份。
 
 ### 启动 API
 
@@ -503,6 +541,8 @@ high_confidence           可选，覆盖高置信度阈值
 ./venv/bin/python -m pytest tests -q
 ./venv/bin/python -m compileall app train_mac.py scripts
 ./venv/bin/python scripts/validate_open_source_baseline.py
+./venv/bin/python scripts/evaluate_public_benchmark.py --strict
+./venv/bin/python -m build
 ```
 
 ### 贡献与许可证
@@ -511,22 +551,28 @@ high_confidence           可选，覆盖高置信度阈值
 - 许可证：`LICENSE`
 - 公开发布说明：`docs/release-notes.md`
 - 数据集获取说明：`docs/datasets.md`
+- 第三方许可证边界：`THIRD_PARTY_NOTICES.md`
+- 文档导航：`docs/README.md`
+- 安全策略：`SECURITY.md`
+- 版本历史：`CHANGELOG.md`
 
 当前验证状态以 `docs/harness/TASK-BOARD.md` 的最新任务记录为准。
 
 ### 安全与运行时约束
 
 - `POST /api/v1/analysis/run` 会校验 `video_path`，防止简单路径穿越。
+- 默认仅允许分析仓库目录内的视频；可通过 `BASKETBALL_ALLOWED_VIDEO_ROOTS` 增加逗号分隔的本地目录或容器挂载目录，例如 `/Users/name/Movies,/mnt/videos`。
 - 任务状态和结果保存在内存 `TaskManager` 中，进程重启后会丢失。
 - 数据集、模型权重和输出目录默认不入库。
 - `app/models/preprocessing.py` 已按 v3 部署口径实现：BGR、`112x112`、`[0,255]`，不 `/255`，无 Kinetics normalize。
 
-### 开源状态与待补充项
+### 开源发布状态
 
-- 仓库包含 `LICENSE`，公开发布前仍需复核第三方依赖、数据集和模型权重的许可证边界。
+- 仓库包含正式包元数据、CI、插件诊断、公开 contract benchmark、SBOM 工具和社区治理文件。
+- 每次发布仍必须复核第三方依赖、数据集和模型权重的许可证边界。
 - 数据集与权重不随仓库分发，需要自行准备 SpaceJam 标注和视频。
 - `requirements.txt` 不是严格 lockfile。
-- 若准备公开发布，需要补充来源声明、许可证、数据集获取说明和权重分发策略。
+- `examples/benchmark/` 只证明公开契约与评测器可复现，不代表生产模型准确率；真实模型发布必须另附带许可数据集上的 IDF1/HOTA、event F1、比分准确率与运行时间。
 
 ## English Summary
 
@@ -541,13 +587,13 @@ Current API entry points:
 Current identity and statistics behavior:
 
 - Long videos are analyzed through overlapped segments by default.
-- `player_identity_features[]` exposes model/fallback appearance embeddings and continuity evidence.
+- `player_identity_features[]` exposes model/fallback body embeddings, torso jersey luminance/dark-ratio features, optional frontal-face embeddings, and continuity evidence. Face detection uses the bundled OpenCV Haar cascade and falls back cleanly when no usable frontal face is visible.
 - `long_video.players[]` exposes lightweight `global_player_id` candidates.
 - `long_video.identity_duplicate_candidates[]` exposes review-only duplicate-ID merge candidates and does not rewrite statistics automatically.
 - `long_video.identity_merge_decisions[]` exposes optional VLM post-processing decisions when `vlm_identity_merge_enabled=true`.
 - `long_video.merged_players[]` exposes confirmed-merge statistics when `confirmed_identity_merges[]` is supplied in the request.
 - `statistics.points`, `assists`, `rebounds`, `blocks`, and `steals` are action-proxy estimates, not official box-score truth. `shoot` clips are exposed as `shot_attempts` and `point_candidate_count`; `points` remains 0 until made-shot, free-throw, or scoreboard-linked scoring confirmation exists. The `statistics.status`, `estimated_fields`, and `candidate_fields` fields make that contract explicit. Block, rebound, steal, and point evidence should be confirmed through event candidates, owner candidates, ball/rim/possession evidence, VLM, scoreboard audit, or human review.
-- `long_video.scoreboard_summary` is emitted when `scoreboard_audit=true`; CLI `accurate` and `vlm-full` enable it by default. The v2 audit ranks OpenCV scoreboard candidates, samples short bursts, reads sharp and temporally fused panel crops independently, and publishes a final score only after same-burst consensus and cross-time monotonicity checks. `inconsistent_scoreboard` means readable candidates disagreed and no final score was published.
+- `long_video.scoreboard_summary` is emitted when `scoreboard_audit=true`; CLI `accurate` and `vlm-full` enable it by default. The v3 audit detects complete dark physical panels, tracks camera motion across 13 consecutive frames, and reads three raw phases, two sharpened boundary frames, and one temporal fusion. Install `requirements-ocr.txt` to let the optional offline RapidOCR adapter read large side-score digits first; unavailable or low-confidence OCR falls back to the configured VLM. Results are published only after burst/cross-anchor consensus and cross-time score/clock checks. `inconsistent_scoreboard` means evidence disagreed and no final score was published.
 
 Setup:
 
@@ -557,6 +603,15 @@ source .venv/bin/activate
 pip install -r requirements-service.txt
 cp .env.example .env
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8765
+```
+
+Package and framework diagnostics:
+
+```bash
+pip install -e ".[api,inference]"
+agu --version
+agu plugins list
+python scripts/evaluate_public_benchmark.py --strict
 ```
 
 Useful docs:

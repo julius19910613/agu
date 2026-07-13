@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use AGU in research, please cite the software release."
+title: "AGU: Extensible Basketball Video Analysis Engine"
+type: software
+authors:
+  - name: "AGU contributors"
+version: 0.1.0
+date-released: 2026-07-13
+license: MIT
+repository-code: "https://github.com/julius19910613/agu"

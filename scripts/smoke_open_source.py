@@ -29,6 +29,9 @@ def run_step(name: str, command: list[str]) -> None:
 def main() -> int:
     run_step("Validate public examples and docs", [sys.executable, "scripts/validate_open_source_baseline.py"])
     run_step("Check CLI entrypoint", [sys.executable, "-m", "app.cli", "--help"])
+    run_step("Check package version", [sys.executable, "-m", "app.cli", "--version"])
+    run_step("Check plugin diagnostics", [sys.executable, "-m", "app.cli", "plugins", "doctor"])
+    run_step("Validate public benchmark", [sys.executable, "scripts/evaluate_public_benchmark.py", "--strict"])
     print("Open-source smoke check passed.")
     return 0
 

@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import sys
 import time
+from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+from app.version import __version__
 
-TERMINAL_STATES = {"completed", "failed"}
+TERMINAL_STATES = {"completed", "failed", "cancelled"}
 
 PRESETS: dict[str, dict[str, Any]] = {
     "fast": {
@@ -32,7 +33,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "vlm_audit": True,
         "vlm_audit_frames": 4,
         "scoreboard_audit": True,
-        "scoreboard_audit_max_frames": 4,
+        "scoreboard_audit_max_frames": 6,
         "tracking_fps": 12.0,
         "yolo_imgsz": 640,
         "action_vid_stride": 12,
@@ -49,7 +50,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "vlm_audit": True,
         "vlm_audit_frames": 4,
         "scoreboard_audit": True,
-        "scoreboard_audit_max_frames": 4,
+        "scoreboard_audit_max_frames": 6,
         "tracking_fps": 12.0,
         "yolo_imgsz": 640,
         "action_vid_stride": 12,
@@ -105,7 +106,8 @@ def _print_status_summary(payload: dict[str, Any]) -> None:
 
 
 def _apply_preset(args: argparse.Namespace) -> dict[str, Any]:
-    payload = dict(PRESETS.get(args.preset or "", {}))
+    payload = _load_profile(getattr(args, "profile", None))
+    payload.update(PRESETS.get(args.preset or "", {}))
     explicit_values = {
         "video_path": args.video,
         "vlm_mode": args.vlm_mode,
@@ -141,9 +143,50 @@ def _apply_preset(args: argparse.Namespace) -> dict[str, Any]:
         "action_vid_stride": args.action_vid_stride,
         "low_confidence": args.low_confidence,
         "high_confidence": args.high_confidence,
+        "max_runtime_sec": args.max_runtime_sec,
     }
     payload.update({key: value for key, value in explicit_values.items() if value is not None})
     return payload
+
+
+def _load_profile(profile_path: str | None) -> dict[str, Any]:
+    if not profile_path:
+        return {}
+    path = Path(profile_path)
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    elif suffix == ".toml":
+        import tomllib
+
+        payload = tomllib.loads(path.read_text(encoding="utf-8"))
+        payload = payload.get("analysis", payload)
+    elif suffix in {".yaml", ".yml"}:
+        try:
+            import yaml
+        except ImportError as exc:
+            raise SystemExit("YAML profiles require the optional PyYAML package") from exc
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    else:
+        raise SystemExit("Analysis profile must use .json, .toml, .yaml, or .yml")
+    if not isinstance(payload, dict):
+        raise SystemExit("Analysis profile must contain an object/table")
+    return dict(payload)
+
+
+def plugins(args: argparse.Namespace) -> int:
+    from app.plugins import registry
+
+    registry.discover()
+    payload = registry.diagnostics(kind=args.kind)
+    if args.plugins_command == "list":
+        payload = {"plugins": payload["plugins"]}
+    _print_json(payload)
+    if args.plugins_command == "doctor":
+        unhealthy = any(not item["available"] for item in payload["plugins"])
+        discovery_errors = bool(payload.get("discovery_errors"))
+        return 1 if args.strict and (unhealthy or discovery_errors) else 0
+    return 0
 
 
 def analyze(args: argparse.Namespace) -> int:
@@ -174,7 +217,16 @@ def analyze(args: argparse.Namespace) -> int:
 def status(args: argparse.Namespace) -> int:
     response = _request_json("GET", f"{args.api_url.rstrip('/')}/api/v1/analysis/status/{args.task_id}")
     _print_json(response) if args.json else _print_status_summary(response)
-    return 0 if response.get("status") != "failed" else 1
+    return 0 if response.get("status") not in {"failed", "cancelled"} else 1
+
+
+def task_action(args: argparse.Namespace) -> int:
+    response = _request_json(
+        "POST",
+        f"{args.api_url.rstrip('/')}/api/v1/analysis/tasks/{args.task_id}/{args.command}",
+    )
+    _print_json(response)
+    return 0
 
 
 def report(args: argparse.Namespace) -> int:
@@ -235,9 +287,10 @@ def evaluate(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="python -m app.cli",
+        prog="agu",
         description="AGU command line client for the running FastAPI analysis service.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--api-url", default="http://127.0.0.1:8765", help="AGU service base URL")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -245,6 +298,7 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser = subparsers.add_parser("analyze", help="Submit an analysis task")
     analyze_parser.add_argument("--video", required=True, help="Video path visible to the AGU service")
     analyze_parser.add_argument("--preset", choices=sorted(PRESETS), default=None)
+    analyze_parser.add_argument("--profile", help="JSON/TOML/YAML analysis profile; explicit flags override it")
     analyze_parser.add_argument("--vlm-mode", choices=["off", "low-confidence", "always"])
     analyze_parser.add_argument("--boxes-file")
     analyze_parser.add_argument("--max-frames", type=int)
@@ -278,6 +332,7 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("--action-vid-stride", type=int)
     analyze_parser.add_argument("--low-confidence", type=float)
     analyze_parser.add_argument("--high-confidence", type=float)
+    analyze_parser.add_argument("--max-runtime-sec", type=float, help="Cooperative analysis deadline; 0 disables it")
     analyze_parser.add_argument("--poll", action="store_true", help="Poll until task completion or failure")
     analyze_parser.add_argument("--poll-interval", type=float, default=2.0)
     analyze_parser.add_argument("--save-result", help="Write completed result JSON to this path when used with --poll")
@@ -288,6 +343,11 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("task_id")
     status_parser.add_argument("--json", action="store_true", help="Print full task JSON")
     status_parser.set_defaults(func=status)
+
+    for command in ("cancel", "retry"):
+        action_parser = subparsers.add_parser(command, help=f"{command.title()} an analysis task")
+        action_parser.add_argument("task_id")
+        action_parser.set_defaults(func=task_action)
 
     report_parser = subparsers.add_parser("report", help="Build per-player Markdown reports from an analysis JSON")
     report_parser.add_argument("--analysis-json", required=True)
@@ -320,6 +380,20 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_parser.add_argument("--fail-below-f1", type=float)
     evaluate_parser.add_argument("--json", action="store_true", help="Print full match details")
     evaluate_parser.set_defaults(func=evaluate)
+
+    plugins_parser = subparsers.add_parser("plugins", help="Inspect installed AGU adapters and pipeline stages")
+    plugins_subparsers = plugins_parser.add_subparsers(dest="plugins_command", required=True)
+    for command in ("list", "doctor"):
+        command_parser = plugins_subparsers.add_parser(command)
+        command_parser.add_argument(
+            "--kind",
+            choices=["model", "tracker", "storage", "stage", "integration"],
+        )
+        if command == "doctor":
+            command_parser.add_argument("--strict", action="store_true", help="Fail when any optional plugin is unavailable")
+        else:
+            command_parser.set_defaults(strict=False)
+        command_parser.set_defaults(func=plugins)
 
     return parser
 

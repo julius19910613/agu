@@ -1,0 +1,6 @@
+{
+  "identity_pairs": [
+    {"left": "segment_000_player_001", "right": "segment_001_player_004", "same_player": true, "confidence": 0.91},
+    {"left": "segment_000_player_001", "right": "segment_001_player_006", "same_player": false, "confidence": 0.89}
+  ]
+}

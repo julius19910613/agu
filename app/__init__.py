@@ -1,1 +1,5 @@
-# Basketball Defense Analysis - FastAPI Application
+"""AGU basketball video analysis engine."""
+
+from app.version import __version__
+
+__all__ = ["__version__"]

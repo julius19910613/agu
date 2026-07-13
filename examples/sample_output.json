@@ -1,9 +1,22 @@
 {
   "task_id": "example-task-id",
+  "request_id": "example-task-id",
   "status": "completed",
   "progress": 100,
   "error": null,
+  "created_at_unix": 1765890000.0,
+  "updated_at_unix": 1765890012.34,
   "result": {
+    "schema_version": "1.0",
+    "pipeline_manifest": {
+      "pipeline_version": "1",
+      "stages": [
+        {"stage": "analysis.validate", "status": "completed", "duration_ms": 0.01},
+        {"stage": "analysis.dispatch", "status": "completed", "duration_ms": 12339.0},
+        {"stage": "analysis.finalize", "status": "completed", "duration_ms": 0.01}
+      ],
+      "metadata": {"schema_version": "1.0", "segmented_analysis": false}
+    },
     "video": "examples/lebron_shoots.mp4",
     "created_at_unix": 1765890000.0,
     "runtime_seconds": 12.34,

@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  framework-core:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: agu --version
+      - run: agu plugins doctor
+      - run: python -m ruff check --select E9,F63,F7,F82 app scripts tests
+      - run: python -m mypy --ignore-missing-imports app/plugins.py app/analysis/pipeline.py app/provenance.py
+      - run: python scripts/evaluate_public_benchmark.py --strict
+      - run: python -m pytest tests/test_framework_foundation.py tests/test_cli.py tests/test_evaluation.py
+      - run: python -m build
+      - run: python scripts/generate_sbom.py --output build/sbom.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-py${{ matrix.python-version }}
+          path: build/sbom.json
+
+  service:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pytest
+      - run: python scripts/verify_harness.py
+      - run: python scripts/smoke_open_source.py

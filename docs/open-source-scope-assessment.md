@@ -1,5 +1,14 @@
 # AGU 开源价值评估与项目剥离建议
 
+> 2026-07-13 P0/P1 update: AGU remains positioned as an extensible basketball
+> video analysis engine/reference pipeline. The repository now has installable
+> package metadata, versioned CLI, typed pipeline hooks, entry-point plugin
+> discovery and diagnostics, response provenance manifests, optional dependency
+> groups, a public contract benchmark, CI/release workflows, SBOM/license
+> governance, task cancellation/retry/deadlines, configuration profiles, and
+> community/security artifacts. This does not broaden AGU into a general CV
+> framework or product BFF.
+
 ## 结论
 
 AGU 适合作为一个开源的篮球视频分析与动作理解项目继续发展，但开源定位应收敛为：

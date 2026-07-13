@@ -50,8 +50,15 @@ def validate_examples() -> None:
 def validate_docs() -> None:
     required_docs = [
         ROOT / "CONTRIBUTING.md",
+        ROOT / "CODE_OF_CONDUCT.md",
+        ROOT / "SECURITY.md",
+        ROOT / "CITATION.cff",
+        ROOT / "CHANGELOG.md",
         ROOT / "LICENSE",
+        ROOT / "THIRD_PARTY_NOTICES.md",
+        ROOT / "pyproject.toml",
         ROOT / "docs/api.md",
+        ROOT / "docs/README.md",
         ROOT / "docs/checkpoints.md",
         ROOT / "docs/datasets.md",
         ROOT / "docs/extensions.md",
@@ -82,7 +89,7 @@ def validate_docs() -> None:
             raise AssertionError(f"docs/model-card.md missing marker: {marker}")
 
     extensions = (ROOT / "docs/extensions.md").read_text(encoding="utf-8")
-    for marker in ["Model Registry", "Tracker Registry", "Storage Backend"]:
+    for marker in ["Plugin Discovery Contract", "Pipeline Stage Contract", "Model Registry", "Tracker Registry", "Storage Backend"]:
         if marker not in extensions:
             raise AssertionError(f"docs/extensions.md missing marker: {marker}")
 
@@ -95,6 +102,14 @@ def validate_docs() -> None:
     for marker in ["Supported Training Layout", "SpaceJam Notes", "Annotation Format"]:
         if marker not in datasets:
             raise AssertionError(f"docs/datasets.md missing marker: {marker}")
+
+    for path in [
+        ROOT / "examples/benchmark/ground_truth.json",
+        ROOT / "examples/benchmark/golden_metrics.json",
+        ROOT / ".github/workflows/ci.yml",
+        ROOT / ".github/workflows/release.yml",
+    ]:
+        require_file(path)
 
 
 def validate_extension_points() -> None:

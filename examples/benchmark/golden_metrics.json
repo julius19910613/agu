@@ -1,0 +1,8 @@
+{
+  "benchmark_version": "1",
+  "scoreboard_accuracy": 1.0,
+  "identity_pair_accuracy": 1.0,
+  "event_precision": 1.0,
+  "event_recall": 1.0,
+  "event_f1": 1.0
+}

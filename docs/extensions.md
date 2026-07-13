@@ -1,6 +1,49 @@
 # AGU Extension Points
 
-AGU keeps its core pipeline small, but exposes lightweight extension points for models, trackers, and output storage.
+AGU exposes a typed pipeline and lightweight extension points for models,
+trackers, storage, stages, and integrations. Existing direct registries remain
+supported; new distributions should also publish plugin metadata.
+
+## Plugin Discovery Contract
+
+An external distribution declares a registration callable:
+
+```toml
+[project.entry-points."agu.plugins"]
+my_plugin = "my_package.plugin:register"
+```
+
+The callable receives `app.plugins.PluginRegistry` and registers one or more
+`PluginSpec` values. It may also call `register_analysis_stage()` at the
+`before_dispatch` or `after_dispatch` hook. Each spec declares `kind`,
+`capabilities`, `version`, optional import requirements, source, and
+description. See `examples/plugins/minimal_plugin.py` for a stage that adds
+non-secret metadata to the real analysis manifest.
+
+Inspect the environment without starting the service or loading model weights:
+
+```bash
+agu plugins list
+agu plugins doctor
+agu plugins doctor --strict
+```
+
+`--strict` is intended for a deployment profile that expects every listed
+optional integration. Normal diagnostics report missing optional adapters but
+exit successfully.
+
+## Pipeline Stage Contract
+
+`app.analysis.pipeline` provides `PipelineContext`, `AnalysisStage`,
+`CallableStage`, and `PipelineRunner`. The current service delegates through the
+`analysis.validate`, `analysis.dispatch`, and `analysis.finalize` built-ins plus
+before/after extension hooks, so single and segmented behavior stay unchanged
+while future extraction can move tracking, inference, fusion, audit, and
+persistence into separately testable stages.
+
+Stage names are unique, every run records status and duration in
+`result.pipeline_manifest`, and exceptions propagate unchanged after a failed
+trace entry is recorded.
 
 ## Model Registry
 
@@ -66,3 +109,7 @@ Future adapters should follow the same `write_json`, `write_bytes`, and `copy_fi
 ## Boundary
 
 These extension points should not add business database writes, authentication, RBAC, or mini-program-specific behavior to AGU.
+
+Detector, tracker, ReID, OCR, pose, VLM, and storage integrations should remain
+optional adapters with a documented fallback. AGU owns stable schemas, task and
+segment orchestration, basketball evidence reconciliation, and evaluation.

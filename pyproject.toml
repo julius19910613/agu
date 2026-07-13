@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agu-basketball"
+dynamic = ["version"]
+description = "Extensible basketball video analysis engine and reference pipeline"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "AGU contributors" }]
+keywords = ["basketball", "video-analysis", "computer-vision", "tracking", "action-recognition"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "pydantic>=2,<3",
+  "pydantic-settings>=2,<3",
+]
+
+[project.optional-dependencies]
+api = ["fastapi", "uvicorn[standard]"]
+inference = [
+  "torch",
+  "torchvision",
+  "opencv-contrib-python-headless",
+  "scikit-learn",
+  "numpy",
+  "Pillow",
+  "ffmpeg-python",
+  "tqdm",
+  "easydict",
+]
+tracking-ultralytics = ["ultralytics"]
+ocr = ["rapidocr-onnxruntime==1.4.4"]
+profiles = ["PyYAML>=6"]
+training = ["pandas", "matplotlib", "scipy", "scikit-image", "vidaug", "joblib"]
+service = [
+  "fastapi",
+  "uvicorn[standard]",
+  "torch",
+  "torchvision",
+  "opencv-contrib-python-headless",
+  "ultralytics",
+  "scikit-learn",
+  "numpy",
+  "Pillow",
+  "ffmpeg-python",
+  "tqdm",
+  "easydict",
+]
+dev = ["fastapi", "httpx", "pytest", "ruff", "mypy", "build", "pip-audit"]
+
+[project.scripts]
+agu = "app.cli:main"
+
+[project.entry-points."agu.plugins"]
+# Third-party packages add registration callables to this group. AGU itself
+# registers built-ins without entry-point indirection.
+
+[project.urls]
+Repository = "https://github.com/julius19910613/agu"
+Documentation = "https://github.com/julius19910613/agu/tree/main/docs"
+Issues = "https://github.com/julius19910613/agu/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "app.version.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["app*", "scripts*", "utils*"]
+exclude = ["tests*", "dataset*", "analysis_outputs*", "output_videos*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]

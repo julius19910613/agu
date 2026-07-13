@@ -98,6 +98,36 @@ def select_active_track_ids(
     return sorted(active_track_ids)
 
 
+def densify_track_boxes(
+    raw_track_data: Sequence[Dict[int, Tuple[float, float, float, float]]],
+    active_track_ids: Sequence[int],
+    max_gap_frames: int = 2,
+) -> List[Tuple[Tuple[float, float, float, float], ...]]:
+    """Build dense box rows while only interpolating brief detector dropouts."""
+    missing_box = (0.0, 0.0, 0.0, 0.0)
+    tracks: Dict[int, List[Optional[Tuple[float, float, float, float]]]] = {
+        track_id: [frame_boxes.get(track_id) for frame_boxes in raw_track_data]
+        for track_id in active_track_ids
+    }
+    for track_id, boxes in tracks.items():
+        known_indices = [index for index, box in enumerate(boxes) if box is not None]
+        for left_index, right_index in zip(known_indices, known_indices[1:]):
+            missing_count = right_index - left_index - 1
+            if missing_count <= 0 or missing_count > max_gap_frames:
+                continue
+            left_box = np.asarray(boxes[left_index], dtype=np.float32)
+            right_box = np.asarray(boxes[right_index], dtype=np.float32)
+            for offset in range(1, missing_count + 1):
+                alpha = offset / float(missing_count + 1)
+                interpolated = left_box * (1.0 - alpha) + right_box * alpha
+                boxes[left_index + offset] = tuple(float(value) for value in interpolated)
+
+    return [
+        tuple(tracks[track_id][frame_index] or missing_box for track_id in active_track_ids)
+        for frame_index in range(len(raw_track_data))
+    ]
+
+
 def resolve_yolo_tracker_config(
     tracker_backend: str = "bytetrack",
     yolo_tracker_config: str = "",
@@ -268,31 +298,11 @@ def extract_tracked_frames(
         if not active_track_ids:
             active_track_ids = [0]
 
-        # Build final player_boxes
-        player_boxes: List[Tuple[Tuple[float, float, float, float], ...]] = []
-        last_known_boxes = {}
-        default_box = (float(width / 3), float(height / 3), float(width / 4), float(height / 2))
-
-        for tid in active_track_ids:
-            found = False
-            for frame_boxes in raw_track_data:
-                if tid in frame_boxes:
-                    last_known_boxes[tid] = frame_boxes[tid]
-                    found = True
-                    break
-            if not found:
-                last_known_boxes[tid] = default_box
-
-        for frame_boxes in raw_track_data:
-            current_frame_boxes = []
-            for tid in active_track_ids:
-                if tid in frame_boxes:
-                    box = frame_boxes[tid]
-                    last_known_boxes[tid] = box
-                else:
-                    box = last_known_boxes[tid]
-                current_frame_boxes.append(box)
-            player_boxes.append(tuple(current_frame_boxes))
+        player_boxes = densify_track_boxes(
+            raw_track_data,
+            active_track_ids,
+            max_gap_frames=2,
+        )
 
         colors: List[Tuple[int, int, int]] = [
             (255, 0, 0),    # Red
@@ -396,11 +406,14 @@ def crop_video(
     w_out, h_out = output_size
     for idx, frame in enumerate(clip):
         x, y, w, h = [int(v) for v in crop_window[idx][player]]
+        if w <= 1 or h <= 1:
+            video.append(np.zeros((h_out, w_out, 3), dtype=np.uint8))
+            continue
         cropped = frame[max(y, 0): max(y + h, 0), max(x, 0): max(x + w, 0)]
         try:
             resized = cv2.resize(cropped, dsize=(w_out, h_out), interpolation=cv2.INTER_NEAREST)
         except cv2.error:
-            resized = video[idx - 1] if (idx > 0 and video) else np.zeros((h_out, w_out, 3), dtype=np.uint8)
+            resized = np.zeros((h_out, w_out, 3), dtype=np.uint8)
         video.append(resized)
     return video
 
@@ -410,7 +423,9 @@ def crop_windows(
     player_boxes: Sequence[Sequence[Sequence[float]]],
     seq_length: int = 16,
     vid_stride: int = 8,
-) -> Dict[int, List[np.ndarray]]:
+    min_visible_ratio: float = 0.0,
+    return_clip_indices: bool = False,
+) -> Dict[int, List[np.ndarray]] | tuple[Dict[int, List[np.ndarray]], Dict[int, List[int]]]:
     """Split video into overlapping windows and crop each player.
 
     Args:
@@ -431,6 +446,7 @@ def crop_windows(
 
     player_count = len(player_boxes[0])
     player_frames: Dict[int, List[np.ndarray]] = {p: [] for p in range(player_count)}
+    player_clip_indices: Dict[int, List[int]] = {p: [] for p in range(player_count)}
     n_clips = max(1, math.ceil((len(video_frames) - seq_length) / vid_stride) + 1)
 
     for clip_idx in range(n_clips):
@@ -446,6 +462,18 @@ def crop_windows(
             crop_win.extend([last_boxes for _ in range(remaining)])
 
         for player in range(player_count):
+            visible_count = sum(
+                1
+                for frame_boxes in crop_win[: len(clip)]
+                if player < len(frame_boxes)
+                and float(frame_boxes[player][2]) > 1.0
+                and float(frame_boxes[player][3]) > 1.0
+            )
+            if visible_count / max(1, seq_length) < max(0.0, min(1.0, min_visible_ratio)):
+                continue
             player_frames[player].append(np.asarray(crop_video(clip, crop_win, player)))
+            player_clip_indices[player].append(clip_idx)
 
+    if return_clip_indices:
+        return player_frames, player_clip_indices
     return player_frames

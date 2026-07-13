@@ -27,13 +27,14 @@ from app.analysis.schemas import (
 )
 from app.analysis.service import AnalysisService
 from app.analysis.vlm import (
+    OllamaVLMVerifier,
     _last_visible_scoreboard,
     _parse_scoreboard_checkpoints,
     extract_json_object,
     normalize_action,
 )
 from app.analysis.fusion import fuse_decision, should_call_vlm, apply_temporal_smoothing
-from app.analysis.tracking import crop_windows, resolve_yolo_tracker_config, select_active_track_ids
+from app.analysis.tracking import crop_windows, densify_track_boxes, resolve_yolo_tracker_config, select_active_track_ids
 from scripts.build_identity_duplicate_report import build_duplicate_report
 
 
@@ -71,6 +72,11 @@ class HybridAnalysisTest(unittest.TestCase):
         settings.identity_embedding_device = "cpu"
         settings.identity_embedding_batch_size = 2
         settings.identity_embedding_allow_fallback = True
+        settings.face_identity_backend = "off"
+        settings.face_detection_model_path = ""
+        settings.face_recognition_model_path = ""
+        settings.face_detection_score_threshold = 0.60
+        settings.face_identity_allow_fallback = True
         settings.jersey_number_vlm_enabled = False
         settings.jersey_number_vlm_frames = 2
         settings.vlm_identity_merge_enabled = False
@@ -161,6 +167,42 @@ class HybridAnalysisTest(unittest.TestCase):
         windows = crop_windows(frames, boxes, seq_length=4, vid_stride=3)
         self.assertEqual(len(windows[0]), 3)
         self.assertEqual(windows[0][0].shape, (4, 176, 128, 3))
+
+    def test_dense_track_boxes_do_not_carry_long_missing_tracks(self):
+        raw = [
+            {7: (0.0, 0.0, 10.0, 20.0)},
+            {},
+            {7: (20.0, 0.0, 10.0, 20.0)},
+            {},
+            {},
+            {},
+        ]
+
+        dense = densify_track_boxes(raw, [7], max_gap_frames=1)
+
+        self.assertEqual(dense[0][0], (0.0, 0.0, 10.0, 20.0))
+        self.assertEqual(dense[1][0], (10.0, 0.0, 10.0, 20.0))
+        self.assertEqual(dense[3][0], (0.0, 0.0, 0.0, 0.0))
+        self.assertEqual(dense[-1][0], (0.0, 0.0, 0.0, 0.0))
+
+    def test_crop_windows_skips_mostly_missing_player_windows(self):
+        frames = [np.full((32, 32, 3), 50, dtype=np.uint8) for _ in range(8)]
+        boxes = [
+            ((2.0, 2.0, 10.0, 20.0),) if index < 2 else ((0.0, 0.0, 0.0, 0.0),)
+            for index in range(8)
+        ]
+
+        windows, indices = crop_windows(
+            frames,
+            boxes,
+            seq_length=4,
+            vid_stride=2,
+            min_visible_ratio=0.75,
+            return_clip_indices=True,
+        )
+
+        self.assertEqual(windows[0], [])
+        self.assertEqual(indices[0], [])
 
     def test_acceleration_request_fields_are_supported(self):
         request = AnalysisRequest(
@@ -570,6 +612,8 @@ class HybridAnalysisTest(unittest.TestCase):
         self.assertGreater(identity_confidences["segment_1:player_7"], 0.6)
         evidence = " ".join(identity_evidence["segment_1:player_7"])
         self.assertIn("embedding similarity", evidence)
+        self.assertIn("SFace similarity", evidence)
+        self.assertIn("jersey darkness gap", evidence)
         self.assertIn("track continuity", evidence)
 
     def test_identity_feature_extraction_generates_sidecar_embedding(self):
@@ -581,6 +625,65 @@ class HybridAnalysisTest(unittest.TestCase):
         self.assertEqual(features[0].embedding_model, "sidecar_hsv_hist_embedding_v1")
         self.assertEqual(features[0].embedding_dim, 128)
         self.assertEqual(len(features[0].appearance_embedding), 128)
+        self.assertIn("torso_luma_mean", features[0].appearance_signature)
+        self.assertIn("jersey_dark_ratio", features[0].appearance_signature)
+
+    def test_identity_feature_extraction_adds_face_sidecar_when_visible(self):
+        service = self.make_service()
+        frames = [np.full((64, 48, 3), fill_value=100 + index, dtype=np.uint8) for index in range(3)]
+        boxes = [[(0.0, 0.0, 48.0, 64.0)]] * 3
+        face = np.full((20, 20, 3), (80, 130, 180), dtype=np.uint8)
+        with patch.object(service, "_detect_face_crop", return_value=face):
+            features = service._extract_player_identity_features(frames, boxes)
+
+        self.assertEqual(features[0].face_sample_count, 3)
+        self.assertEqual(len(features[0].face_embedding), 128)
+        self.assertIn("opencv_haar_face", features[0].face_embedding_model)
+
+    def test_identity_similarity_rejects_conflicting_jersey_tones(self):
+        service = self.make_service()
+        common = dict(
+            player=0,
+            start_frame=0,
+            end_frame=10,
+            appearance_embedding=[1.0, 0.0],
+            face_embedding=[1.0, 0.0],
+            face_sample_count=1,
+        )
+        dark = PlayerIdentityFeatureResponse(
+            **common,
+            appearance_signature={"jersey_dark_ratio": 0.9},
+        )
+        light = PlayerIdentityFeatureResponse(
+            **{**common, "player": 1},
+            appearance_signature={"jersey_dark_ratio": 0.1},
+        )
+
+        self.assertLessEqual(service._appearance_similarity(dark, light), 0.35)
+
+    def test_identity_similarity_rejects_conflicting_sface_embeddings(self):
+        service = self.make_service()
+        common = dict(
+            start_frame=0,
+            end_frame=10,
+            appearance_signature={"jersey_dark_ratio": 0.4},
+            appearance_embedding=[1.0, 0.0],
+            face_sample_count=2,
+            face_embedding_model="opencv_yunet_2023mar+sface_2021dec_embedding_v1",
+            face_embedding_quality=0.8,
+        )
+        left = PlayerIdentityFeatureResponse(
+            player=0,
+            face_embedding=[1.0, 0.0],
+            **common,
+        )
+        right = PlayerIdentityFeatureResponse(
+            player=1,
+            face_embedding=[0.0, 1.0],
+            **common,
+        )
+
+        self.assertLessEqual(service._appearance_similarity(left, right), 0.40)
 
     def test_identity_feature_extraction_can_use_torchvision_backend(self):
         service = self.make_service()
@@ -1262,6 +1365,16 @@ class HybridAnalysisTest(unittest.TestCase):
                 self.assertEqual(response.status_code, 400)
                 self.assertIn("Access denied", response.json()["detail"])
 
+    def test_video_path_allows_configured_external_root(self):
+        from app.analysis.router import _video_path_is_allowed
+        from app.config import Settings
+
+        settings = Settings(allowed_video_roots="/Users/example/Movies,/mnt/videos")
+
+        self.assertTrue(_video_path_is_allowed("/Users/example/Movies/game.mov", settings))
+        self.assertTrue(_video_path_is_allowed("/mnt/videos/game.mov", settings))
+        self.assertFalse(_video_path_is_allowed("/Users/example/Documents/game.mov", settings))
+
     def test_temporal_smoothing_non_contiguous_indices(self):
         records = [
             {
@@ -1796,19 +1909,358 @@ class HybridAnalysisTest(unittest.TestCase):
         self.assertIsNotNone(box)
         self.assertGreater(box[0] + box[2], 350)
 
-    def test_scoreboard_candidate_selection_prefers_latest_diverse_times(self):
+    def test_scoreboard_candidate_scoring_rejects_large_solid_color_regions(self):
+        service = self.make_service()
+        frame = np.full((360, 640, 3), 220, dtype=np.uint8)
+        cv2.rectangle(frame, (10, 60), (250, 190), (0, 0, 230), -1)
+        cv2.circle(frame, (80, 100), 16, (0, 230, 255), -1)
+
+        score, box = service._score_scoreboard_candidate(frame)
+
+        self.assertEqual(score, 0.0)
+        self.assertIsNone(box)
+
+    def test_scoreboard_candidate_scoring_retains_multiple_led_panels(self):
+        service = self.make_service()
+        frame = np.full((360, 640, 3), 210, dtype=np.uint8)
+        for left in (30, 390):
+            cv2.rectangle(frame, (left, 130), (left + 200, 230), (20, 20, 20), -1)
+            cv2.putText(frame, "12", (left + 15, 195), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (255, 255, 40), 5)
+            cv2.putText(frame, "9", (left + 135, 195), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (60, 255, 60), 5)
+            cv2.putText(frame, "Q4", (left + 70, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (20, 20, 240), 2)
+
+        candidates = service._score_scoreboard_candidates(frame, max_candidates=4)
+
+        centers = sorted(box[0] + box[2] / 2.0 for _, box in candidates)
+        self.assertGreaterEqual(len(centers), 2)
+        self.assertLess(centers[0], 250)
+        self.assertGreater(centers[-1], 390)
+
+    def test_scoreboard_candidate_scoring_recovers_occluded_led_panel(self):
+        service = self.make_service()
+        frame = np.full((360, 640, 3), 220, dtype=np.uint8)
+        cv2.rectangle(frame, (370, 125), (565, 225), (25, 25, 25), -1)
+        cv2.rectangle(frame, (462, 110), (474, 245), (210, 210, 210), -1)
+        cv2.putText(frame, "108", (378, 185), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 255, 0), 5)
+        cv2.putText(frame, "90", (500, 185), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 255, 0), 5)
+        cv2.putText(frame, "A", (390, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 3)
+        cv2.putText(frame, "B", (530, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 3)
+        cv2.line(frame, (440, 145), (495, 145), (0, 0, 255), 3)
+        cv2.line(frame, (440, 155), (495, 155), (0, 255, 255), 3)
+
+        candidates = service._score_scoreboard_candidates(frame, max_candidates=4)
+
+        self.assertTrue(candidates)
+        self.assertTrue(any(box[0] >= 350 and box[0] + box[2] <= 590 for _, box in candidates))
+
+    def test_scoreboard_vlm_gate_rejects_rolling_shutter_bar(self):
+        service = self.make_service()
+        rolling = np.zeros((420, 1200, 3), dtype=np.uint8)
+        cv2.rectangle(rolling, (220, 165), (980, 255), (255, 255, 0), -1)
+
+        clear = np.zeros((420, 1200, 3), dtype=np.uint8)
+        cv2.rectangle(clear, (220, 165), (420, 255), (255, 255, 0), -1)
+        cv2.rectangle(clear, (790, 165), (970, 255), (255, 255, 0), -1)
+
+        self.assertFalse(service._scoreboard_crop_has_separable_score_digits(rolling))
+        self.assertTrue(service._scoreboard_crop_has_separable_score_digits(clear))
+
+    def test_identity_continuity_uses_time_aligned_overlap_boxes(self):
+        from app.analysis.schemas import PlayerIdentityFeatureResponse
+
+        service = self.make_service()
+        left = PlayerIdentityFeatureResponse(
+            player=0,
+            start_frame=0,
+            end_frame=100,
+            first_center=[100.0, 100.0],
+            last_center=[900.0, 500.0],
+            sampled_boxes=[
+                {"time_sec": 27.0, "x": 300.0, "y": 200.0, "w": 100.0, "h": 220.0, "cx": 350.0, "cy": 310.0},
+                {"time_sec": 29.5, "x": 700.0, "y": 220.0, "w": 100.0, "h": 220.0, "cx": 750.0, "cy": 330.0},
+            ],
+        )
+        matching = PlayerIdentityFeatureResponse(
+            player=1,
+            start_frame=90,
+            end_frame=190,
+            first_center=[0.0, 0.0],
+            last_center=[100.0, 100.0],
+            sampled_boxes=[
+                {"time_sec": 27.05, "x": 304.0, "y": 202.0, "w": 100.0, "h": 220.0, "cx": 354.0, "cy": 312.0},
+                {"time_sec": 29.55, "x": 704.0, "y": 222.0, "w": 100.0, "h": 220.0, "cx": 754.0, "cy": 332.0},
+            ],
+        )
+        different = matching.model_copy(
+            update={
+                "sampled_boxes": [
+                    {"time_sec": 27.05, "x": 1200.0, "y": 200.0, "w": 100.0, "h": 220.0, "cx": 1250.0, "cy": 310.0},
+                ]
+            }
+        )
+
+        self.assertGreater(service._track_continuity_similarity(left, matching), 0.90)
+        self.assertLess(service._track_continuity_similarity(left, different), 0.10)
+
+    def test_identity_stitch_does_not_merge_without_timed_overlap_evidence(self):
+        service = self.make_service()
+        summaries = [
+            LongVideoPlayerSummaryResponse(
+                player_id=f"segment_{segment}:player_2",
+                segments_seen=1,
+                clip_count=5,
+                action_counts={"run": 5},
+                needs_review_count=0,
+                average_confidence=0.8,
+            )
+            for segment in (0, 1)
+        ]
+        features = {
+            "segment_0:player_2": PlayerIdentityFeatureResponse(
+                player=2,
+                segment_id=0,
+                local_player_id="segment_0:player_2",
+                start_frame=0,
+                end_frame=100,
+                first_center=[100.0, 100.0],
+                last_center=[100.0, 100.0],
+                appearance_embedding=[1.0, 0.0],
+                sampled_boxes=[{"time_sec": 20.0, "x": 50.0, "y": 50.0, "w": 50.0, "h": 100.0, "cx": 75.0, "cy": 100.0}],
+            ),
+            "segment_1:player_2": PlayerIdentityFeatureResponse(
+                player=2,
+                segment_id=1,
+                local_player_id="segment_1:player_2",
+                start_frame=90,
+                end_frame=190,
+                first_center=[100.0, 100.0],
+                last_center=[100.0, 100.0],
+                appearance_embedding=[1.0, 0.0],
+                sampled_boxes=[{"time_sec": 32.0, "x": 50.0, "y": 50.0, "w": 50.0, "h": 100.0, "cx": 75.0, "cy": 100.0}],
+            ),
+        }
+
+        identity_map, _, _ = service._merge_segment_local_identities(summaries, features)
+
+        self.assertNotEqual(identity_map["segment_0:player_2"], identity_map["segment_1:player_2"])
+
+    def test_identity_stitch_allows_quality_sface_without_overlap_track(self):
+        service = self.make_service()
+        summaries = [
+            LongVideoPlayerSummaryResponse(
+                player_id=f"segment_{segment}:player_2",
+                segments_seen=1,
+                clip_count=5,
+                action_counts={"run": 5},
+                needs_review_count=0,
+                average_confidence=0.8,
+            )
+            for segment in (0, 1)
+        ]
+        shared_face = [1.0, 0.0, 0.0]
+        features = {
+            "segment_0:player_2": PlayerIdentityFeatureResponse(
+                player=2,
+                segment_id=0,
+                local_player_id="segment_0:player_2",
+                start_frame=0,
+                end_frame=100,
+                appearance_embedding=[1.0, 0.0],
+                appearance_signature={"jersey_dark_ratio": 0.82},
+                face_embedding=shared_face,
+                face_embedding_model="opencv_sface_test",
+                face_sample_count=3,
+                face_embedding_quality=0.80,
+                sampled_boxes=[{"time_sec": 20.0, "cx": 75.0, "cy": 100.0}],
+            ),
+            "segment_1:player_2": PlayerIdentityFeatureResponse(
+                player=2,
+                segment_id=1,
+                local_player_id="segment_1:player_2",
+                start_frame=90,
+                end_frame=190,
+                appearance_embedding=[1.0, 0.0],
+                appearance_signature={"jersey_dark_ratio": 0.78},
+                face_embedding=shared_face,
+                face_embedding_model="opencv_sface_test",
+                face_sample_count=2,
+                face_embedding_quality=0.75,
+                sampled_boxes=[{"time_sec": 32.0, "cx": 75.0, "cy": 100.0}],
+            ),
+        }
+
+        identity_map, _, evidence = service._merge_segment_local_identities(summaries, features)
+
+        self.assertEqual(identity_map["segment_0:player_2"], identity_map["segment_1:player_2"])
+        self.assertIn("SFace similarity", " ".join(evidence["segment_1:player_2"]))
+
+    def test_identity_stitch_rejects_sface_match_with_different_jersey_darkness(self):
+        service = self.make_service()
+        summaries = [
+            LongVideoPlayerSummaryResponse(
+                player_id=f"segment_{segment}:player_2",
+                segments_seen=1,
+                clip_count=5,
+                action_counts={"run": 5},
+                needs_review_count=0,
+                average_confidence=0.8,
+            )
+            for segment in (0, 1)
+        ]
+        features = {
+            f"segment_{segment}:player_2": PlayerIdentityFeatureResponse(
+                player=2,
+                segment_id=segment,
+                local_player_id=f"segment_{segment}:player_2",
+                start_frame=segment * 100,
+                end_frame=segment * 100 + 99,
+                appearance_embedding=[1.0, 0.0],
+                appearance_signature={"jersey_dark_ratio": darkness},
+                face_embedding=[1.0, 0.0, 0.0],
+                face_embedding_model="opencv_sface_test",
+                face_sample_count=3,
+                face_embedding_quality=0.80,
+                sampled_boxes=[{"time_sec": time_sec, "cx": 75.0, "cy": 100.0}],
+            )
+            for segment, darkness, time_sec in ((0, 0.90, 20.0), (1, 0.10, 32.0))
+        }
+
+        identity_map, _, _ = service._merge_segment_local_identities(summaries, features)
+
+        self.assertNotEqual(identity_map["segment_0:player_2"], identity_map["segment_1:player_2"])
+
+    def test_scoreboard_candidate_selection_reserves_slots_for_latest_panels(self):
         service = self.make_service()
         candidates = [
             {"time_sec": 10.0, "score": 900.0, "box": (0, 0, 10, 10)},
             {"time_sec": 100.0, "score": 800.0, "box": (0, 0, 10, 10)},
             {"time_sec": 101.0, "score": 790.0, "box": (0, 0, 10, 10)},
             {"time_sec": 130.0, "score": 700.0, "box": (0, 0, 10, 10)},
-            {"time_sec": 145.0, "score": 650.0, "box": (0, 0, 10, 10)},
+            {"time_sec": 145.0, "score": 151.0, "box": (200, 100, 10, 10)},
         ]
 
         selected = service._select_scoreboard_candidates(candidates, max_frames=3)
 
-        self.assertEqual([item["time_sec"] for item in selected], [101.0, 130.0, 145.0])
+        self.assertEqual([item["time_sec"] for item in selected], [100.0, 130.0, 145.0])
+
+    def test_scoreboard_candidate_selection_uses_best_frame_in_late_time_cluster(self):
+        service = self.make_service()
+        candidates = [
+            {"time_sec": 656.5, "score": 1400.0, "box": (100, 100, 200, 90)},
+            {"time_sec": 819.5, "score": 999.0, "box": (110, 100, 200, 90)},
+            {"time_sec": 823.5, "score": 224.0, "box": (120, 100, 200, 90)},
+            {"time_sec": 836.0, "score": 1000.0, "box": (130, 100, 200, 90)},
+            {"time_sec": 851.5, "score": 824.0, "box": (140, 100, 200, 90)},
+        ]
+
+        selected = service._select_scoreboard_candidates(candidates, max_frames=4)
+
+        selected_times = [item["time_sec"] for item in selected]
+        self.assertIn(819.5, selected_times)
+        self.assertNotIn(823.5, selected_times)
+
+    def test_scoreboard_candidate_selection_keeps_strong_terminal_before_weak_tail(self):
+        service = self.make_service()
+        candidates = [
+            {"time_sec": 695.0, "score": 968.0, "box": (1400, 420, 240, 93)},
+            *[
+                {
+                    "time_sec": float(time_sec),
+                    "score": 2000.0 + index,
+                    "box": (100 + index * 10, 300, 260, 100),
+                }
+                for index, time_sec in enumerate(range(100, 650, 25))
+            ],
+            *[
+                {
+                    "time_sec": float(time_sec),
+                    "score": 180.0 + index,
+                    "box": (300 + index * 10, 400, 220, 90),
+                }
+                for index, time_sec in enumerate((710, 720, 730, 740, 750, 760, 770, 780))
+            ],
+        ]
+
+        selected = service._select_scoreboard_candidates(candidates, max_frames=8)
+        selected_times = {float(candidate["time_sec"]) for candidate in selected}
+
+        self.assertIn(695.0, selected_times)
+        self.assertIn(780.0, selected_times)
+
+    def test_scoreboard_prompt_explains_vertical_multi_digit_layout(self):
+        verifier = OllamaVLMVerifier()
+
+        prompt = verifier._build_scoreboard_prompt([695.1], "same-anchor phase comparison")
+
+        self.assertIn("laid out horizontally OR vertically", prompt)
+        self.assertIn("concatenate them from top to bottom", prompt)
+        self.assertIn("left_score 69", prompt)
+        self.assertIn("right_score 52", prompt)
+
+    def test_scoreboard_prior_context_uses_reconciled_earlier_score(self):
+        service = self.make_service()
+        checkpoints = [
+            ScoreboardCheckpointResponse(
+                time_sec=589.3,
+                frame=17679,
+                visible=True,
+                left_score=52,
+                right_score=50,
+                confidence=0.95,
+                source="rapidocr_scoreboard_v1",
+            ),
+            ScoreboardCheckpointResponse(
+                time_sec=589.3,
+                frame=17680,
+                visible=True,
+                left_score=52,
+                right_score=50,
+                confidence=0.92,
+                source="rapidocr_scoreboard_v1",
+            ),
+        ]
+
+        context = service._scoreboard_prior_context(checkpoints, 695.1)
+
+        self.assertIn("left 52, right 50", context)
+        self.assertIn("cannot decrease", context)
+        self.assertIn("physically implausible", context)
+
+    def test_scoreboard_burst_spans_rolling_shutter_phase(self):
+        service = self.make_service()
+
+        self.assertEqual(service._scoreboard_burst_radius_frames(30.0), 18)
+        self.assertEqual(service._scoreboard_burst_radius_frames(10.0), 6)
+
+    def test_scoreboard_burst_prefers_fresh_panel_detection_during_camera_pan(self):
+        service = self.make_service()
+        frame = np.zeros((100, 200, 3), dtype=np.uint8)
+        fresh_box = (120, 20, 50, 30)
+        stale_box = (10, 20, 50, 30)
+
+        with patch.object(
+            service,
+            "_score_scoreboard_candidates",
+            return_value=[(900.0, fresh_box)],
+        ), patch.object(service, "_track_scoreboard_template", return_value=stale_box):
+            resolved = service._resolve_scoreboard_burst_box(frame, frame, stale_box)
+
+        self.assertEqual(resolved, fresh_box)
+
+    def test_scoreboard_burst_keeps_stable_template_when_detection_is_nearby(self):
+        service = self.make_service()
+        frame = np.zeros((100, 300, 3), dtype=np.uint8)
+        tracked_box = (100, 20, 50, 30)
+        fresh_box = (115, 22, 50, 30)
+
+        with patch.object(
+            service,
+            "_score_scoreboard_candidates",
+            return_value=[(900.0, fresh_box)],
+        ), patch.object(service, "_track_scoreboard_template", return_value=tracked_box):
+            resolved = service._resolve_scoreboard_burst_box(frame, frame, tracked_box)
+
+        self.assertEqual(resolved, tracked_box)
 
     def test_scoreboard_reconciliation_accepts_burst_consensus(self):
         service = self.make_service()
@@ -1824,6 +2276,33 @@ class HybridAnalysisTest(unittest.TestCase):
         self.assertEqual(summary.final_left_score, 120)
         self.assertEqual(summary.final_right_score, 96)
         self.assertEqual(summary.final_total_points, 216)
+
+    def test_scoreboard_reconciliation_rejects_implausible_late_ocr_jump(self):
+        service = self.make_service()
+        checkpoints = [
+            ScoreboardCheckpointResponse(time_sec=588.6, frame=17658, visible=True, left_score=52, right_score=50, confidence=0.99, source="rapidocr_scoreboard_v1"),
+            ScoreboardCheckpointResponse(time_sec=588.6, frame=17659, visible=True, left_score=52, right_score=50, confidence=0.98, source="rapidocr_scoreboard_v1"),
+            ScoreboardCheckpointResponse(time_sec=694.7, frame=20841, visible=True, left_score=95, right_score=92, confidence=0.99, source="rapidocr_scoreboard_v1"),
+            ScoreboardCheckpointResponse(time_sec=694.7, frame=20842, visible=True, left_score=95, right_score=92, confidence=0.98, source="rapidocr_scoreboard_v1"),
+        ]
+
+        summary = service._reconcile_scoreboard_checkpoints(checkpoints)
+
+        self.assertEqual(summary.status, "inconsistent_scoreboard")
+        self.assertIsNone(summary.final_left_score)
+
+    def test_scoreboard_reconciliation_rejects_late_score_decrease(self):
+        service = self.make_service()
+        checkpoints = [
+            ScoreboardCheckpointResponse(time_sec=409.4, frame=12282, visible=True, left_score=67, right_score=63, confidence=0.991, source="rapidocr_scoreboard_v1"),
+            ScoreboardCheckpointResponse(time_sec=463.8, frame=13914, visible=True, left_score=11, right_score=65, confidence=0.99, source="rapidocr_scoreboard_v1"),
+            ScoreboardCheckpointResponse(time_sec=463.8, frame=13915, visible=True, left_score=11, right_score=65, confidence=0.98, source="rapidocr_scoreboard_v1"),
+        ]
+
+        summary = service._reconcile_scoreboard_checkpoints(checkpoints)
+
+        self.assertEqual(summary.status, "inconsistent_scoreboard")
+        self.assertIsNone(summary.final_left_score)
 
     def test_scoreboard_reconciliation_rejects_single_read_and_score_decrease(self):
         service = self.make_service()
@@ -1853,6 +2332,158 @@ class HybridAnalysisTest(unittest.TestCase):
 
         self.assertEqual(summary.status, "ok")
         self.assertEqual((summary.final_left_score, summary.final_right_score), (120, 96))
+
+    def test_scoreboard_reconciliation_rejects_weak_implausible_score_jump(self):
+        service = self.make_service()
+        checkpoints = [
+            ScoreboardCheckpointResponse(time_sec=693.6, frame=20808, visible=True, left_score=99, right_score=80, confidence=0.95, period="4", game_clock="3"),
+            ScoreboardCheckpointResponse(time_sec=693.6, frame=20808, visible=True, left_score=99, right_score=80, confidence=0.92, period="4", game_clock="3"),
+            ScoreboardCheckpointResponse(time_sec=693.6, frame=20808, visible=True, left_score=99, right_score=80, confidence=0.90, period="4", game_clock="3"),
+            ScoreboardCheckpointResponse(time_sec=706.0, frame=21180, visible=True, left_score=99, right_score=128, confidence=0.90, period="4", game_clock="24"),
+            ScoreboardCheckpointResponse(time_sec=706.0, frame=21180, visible=True, left_score=99, right_score=128, confidence=0.87, period="4", game_clock="24"),
+        ]
+
+        summary = service._reconcile_scoreboard_checkpoints(checkpoints)
+
+        self.assertEqual(summary.status, "ok")
+        self.assertEqual((summary.final_left_score, summary.final_right_score), (99, 80))
+        self.assertTrue(any("implausible" in note for note in summary.notes))
+
+    def test_scoreboard_reconciliation_prefers_independent_cross_anchor_reads(self):
+        service = self.make_service()
+        checkpoints = [
+            *[
+                ScoreboardCheckpointResponse(time_sec=71.6, frame=2148, visible=True, left_score=24, right_score=16, confidence=0.85)
+                for _ in range(4)
+            ],
+            ScoreboardCheckpointResponse(time_sec=638.0, frame=19140, visible=True, left_score=5, right_score=8, confidence=0.95),
+            ScoreboardCheckpointResponse(time_sec=659.5, frame=19785, visible=True, left_score=5, right_score=8, confidence=0.90),
+        ]
+
+        summary = service._reconcile_scoreboard_checkpoints(checkpoints)
+
+        self.assertEqual(summary.status, "ok")
+        self.assertEqual((summary.final_left_score, summary.final_right_score), (5, 8))
+        self.assertTrue(any("Cross-anchor consensus" in note for note in summary.notes))
+
+    def test_scoreboard_reconciliation_accepts_plausible_later_score_with_slightly_lower_quality(self):
+        service = self.make_service()
+        checkpoints = [
+            ScoreboardCheckpointResponse(time_sec=486.9, frame=14607, visible=True, left_score=6, right_score=6, confidence=0.95),
+            ScoreboardCheckpointResponse(time_sec=486.9, frame=14607, visible=True, left_score=6, right_score=6, confidence=0.90),
+            ScoreboardCheckpointResponse(time_sec=844.3, frame=25329, visible=True, left_score=21, right_score=19, confidence=0.85),
+            ScoreboardCheckpointResponse(time_sec=844.3, frame=25329, visible=True, left_score=21, right_score=19, confidence=0.82),
+        ]
+
+        summary = service._reconcile_scoreboard_checkpoints(checkpoints)
+
+        self.assertEqual((summary.final_left_score, summary.final_right_score), (21, 19))
+
+    def test_scoreboard_reconciliation_prioritizes_consensus_ocr_over_vlm_conflict(self):
+        service = self.make_service()
+        checkpoints = [
+            ScoreboardCheckpointResponse(time_sec=819.3, frame=24590, visible=True, left_score=38, right_score=36, confidence=0.985, source="rapidocr_scoreboard_v1"),
+            ScoreboardCheckpointResponse(time_sec=819.3, frame=24590, visible=True, left_score=38, right_score=36, confidence=0.989, source="rapidocr_scoreboard_v1"),
+            ScoreboardCheckpointResponse(time_sec=836.2, frame=25086, visible=True, left_score=12, right_score=35, confidence=0.95, source="vlm_scoreboard_burst_audit_v3"),
+            ScoreboardCheckpointResponse(time_sec=836.2, frame=25086, visible=True, left_score=12, right_score=35, confidence=0.94, source="vlm_scoreboard_burst_audit_v3"),
+        ]
+
+        summary = service._reconcile_scoreboard_checkpoints(checkpoints)
+
+        self.assertEqual(summary.status, "ok")
+        self.assertEqual((summary.final_left_score, summary.final_right_score), (38, 36))
+        self.assertTrue(any("deterministic OCR" in note for note in summary.notes))
+
+    def test_scoreboard_reconciliation_uses_higher_confidence_sharpened_ocr_candidate(self):
+        service = self.make_service()
+        checkpoints = [
+            ScoreboardCheckpointResponse(time_sec=692.4, frame=20798, visible=True, left_score=66, right_score=80, confidence=0.994, source="rapidocr_scoreboard_v1"),
+            ScoreboardCheckpointResponse(time_sec=692.4, frame=20798, visible=True, left_score=99, right_score=80, confidence=0.996, source="rapidocr_scoreboard_v1"),
+            ScoreboardCheckpointResponse(time_sec=692.4, frame=20798, visible=True, left_score=99, right_score=0, confidence=0.95, source="vlm_scoreboard_burst_audit_v3"),
+            ScoreboardCheckpointResponse(time_sec=692.4, frame=20798, visible=True, left_score=99, right_score=0, confidence=0.94, source="vlm_scoreboard_burst_audit_v3"),
+        ]
+
+        summary = service._reconcile_scoreboard_checkpoints(checkpoints)
+
+        self.assertEqual(summary.status, "ok")
+        self.assertEqual((summary.final_left_score, summary.final_right_score), (99, 80))
+
+    def test_scoreboard_reconciliation_fuses_reliable_sides_from_ocr_and_vlm(self):
+        from unittest.mock import MagicMock
+        from app.analysis.schemas import ScoreboardCheckpointResponse
+        from app.analysis.service import AnalysisService
+        from app.config import Settings
+
+        service = AnalysisService(settings=Settings(), model=MagicMock(), device="cpu")
+        checkpoints = [
+            ScoreboardCheckpointResponse(time_sec=549.9, frame=16497, visible=True, left_score=92, right_score=77, confidence=0.85, source="vlm_scoreboard_burst_audit_v3"),
+            ScoreboardCheckpointResponse(time_sec=549.9, frame=16494, visible=True, left_score=92, right_score=0, confidence=0.85, source="vlm_scoreboard_burst_audit_v3"),
+            ScoreboardCheckpointResponse(time_sec=549.9, frame=16500, visible=True, left_score=92, right_score=0, confidence=0.84, source="vlm_scoreboard_burst_audit_v3"),
+            ScoreboardCheckpointResponse(time_sec=692.4, frame=20772, visible=True, left_score=66, right_score=80, confidence=0.97, source="rapidocr_scoreboard_v1"),
+            ScoreboardCheckpointResponse(time_sec=692.4, frame=20780, visible=True, left_score=99, right_score=0, confidence=0.85, source="vlm_scoreboard_burst_audit_v3"),
+            ScoreboardCheckpointResponse(time_sec=692.4, frame=20781, visible=True, left_score=99, right_score=0, confidence=0.84, source="vlm_scoreboard_burst_audit_v3"),
+            ScoreboardCheckpointResponse(time_sec=692.4, frame=20782, visible=True, left_score=99, right_score=None, confidence=0.85, source="vlm_scoreboard_burst_audit_v3"),
+        ]
+
+        summary = service._reconcile_scoreboard_checkpoints(checkpoints)
+
+        self.assertEqual(summary.status, "ok")
+        self.assertEqual((summary.final_left_score, summary.final_right_score), (99, 80))
+        self.assertTrue(
+            any(checkpoint.source == "scoreboard_component_fusion_v1" for checkpoint in summary.checkpoints)
+        )
+
+    def test_scoreboard_reconciliation_rejects_repeated_field_misalignment(self):
+        from app.analysis.schemas import ScoreboardCheckpointResponse
+
+        service = self.make_service()
+        checkpoints = [
+            *[
+                ScoreboardCheckpointResponse(time_sec=265.5, frame=7965, visible=True, left_score=106, right_score=90, confidence=0.98, source="rapidocr_scoreboard_v1")
+                for _ in range(5)
+            ],
+            *[
+                ScoreboardCheckpointResponse(time_sec=323.4, frame=9702, visible=True, left_score=120, right_score=130, confidence=0.85, source="vlm_scoreboard_burst_audit_v3")
+                for _ in range(2)
+            ],
+            *[
+                ScoreboardCheckpointResponse(time_sec=347.7, frame=10431, visible=True, left_score=108, right_score=90, confidence=0.75, source="vlm_scoreboard_burst_audit_v3")
+                for _ in range(3)
+            ],
+            ScoreboardCheckpointResponse(time_sec=359.6, frame=10788, visible=True, left_score=120, right_score=130, confidence=0.85, source="vlm_scoreboard_burst_audit_v3"),
+        ]
+
+        summary = service._reconcile_scoreboard_checkpoints(checkpoints)
+
+        self.assertEqual(summary.status, "ok")
+        self.assertEqual((summary.final_left_score, summary.final_right_score), (108, 90))
+        self.assertTrue(any("implausible" in note for note in summary.notes))
+
+    def test_scoreboard_reconciliation_rejects_late_truncated_three_digit_score(self):
+        from app.analysis.schemas import ScoreboardCheckpointResponse
+
+        service = self.make_service()
+        checkpoints = [
+            *[
+                ScoreboardCheckpointResponse(time_sec=348.1, frame=10443, visible=True, left_score=108, right_score=90, confidence=0.85)
+                for _ in range(3)
+            ],
+            *[
+                ScoreboardCheckpointResponse(time_sec=382.4, frame=11472, visible=True, left_score=10, right_score=90, confidence=0.95)
+                for _ in range(5)
+            ],
+            *[
+                ScoreboardCheckpointResponse(time_sec=384.5, frame=11535, visible=True, left_score=10, right_score=90, confidence=0.96)
+                for _ in range(6)
+            ],
+        ]
+
+        summary = service._reconcile_scoreboard_checkpoints(checkpoints)
+
+        self.assertEqual(summary.status, "ok")
+        self.assertEqual((summary.final_left_score, summary.final_right_score), (108, 90))
+        self.assertTrue(any("truncated score" in note for note in summary.notes))
+
 
     def test_scoreboard_conflict_selects_latest_distinct_candidates(self):
         service = self.make_service()

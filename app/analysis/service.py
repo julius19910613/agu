@@ -6,6 +6,7 @@ import os
 import tempfile
 import time
 from collections import Counter, defaultdict
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
@@ -39,12 +40,23 @@ from app.analysis.schemas import (
 )
 from app.analysis.tracking import extract_tracked_frames, crop_windows
 from app.analysis.identity_embedding import BaseIdentityEmbedder, build_identity_embedder
+from app.analysis.face_identity import OpenCvSFaceIdentityAdapter, build_face_identity_adapter
+from app.analysis.scoreboard_ocr import RapidOCRScoreboardReader, build_scoreboard_ocr_reader
 from app.analysis.event_owner import build_event_owner_candidates
 from app.analysis.inference import predict_player_clips
 from app.analysis.motion import compute_motion_features
 from app.analysis.vlm import OllamaVLMVerifier
 from app.analysis.fusion import fuse_decision, should_call_vlm, apply_temporal_smoothing, summarize_records
 from app.video.writer import write_annotated_video
+from app.analysis.pipeline import (
+    CallableStage,
+    PipelineContext,
+    PipelineRunner,
+    list_analysis_stages,
+    pipeline_manifest,
+)
+from app.plugins import registry as plugin_registry
+from app.provenance import checkpoint_provenance
 
 
 LOGGER = logging.getLogger(__name__)
@@ -60,6 +72,17 @@ class AnalysisService:
         self.device = device
         self._identity_embedder_key: Optional[tuple[str, str, str, int, bool]] = None
         self._identity_embedder: Optional[BaseIdentityEmbedder] = None
+        self._face_identity_adapter_key: Optional[tuple[str, str, str, float, bool]] = None
+        self._face_identity_adapter: Optional[OpenCvSFaceIdentityAdapter] = None
+        self._face_cascade: Optional[cv2.CascadeClassifier] = None
+        self._scoreboard_ocr_reader: Optional[RapidOCRScoreboardReader] = None
+        self._scoreboard_ocr_key: Optional[tuple[str, float]] = None
+        model_path = getattr(self.settings, "model_path", None)
+        self._model_provenance = (
+            checkpoint_provenance(model_path, getattr(self.settings, "base_model_name", "best"))
+            if model_path
+            else {"status": "unknown"}
+        )
         try:
             torch_num_threads = int(self.settings.torch_num_threads)
         except (TypeError, ValueError):
@@ -106,10 +129,60 @@ class AnalysisService:
         request: AnalysisRequest,
         progress_callback: Optional[ProgressCallback] = None,
     ) -> AnalysisResponse:
-        """Run either the standard single-pass pipeline or long-video segmented pipeline."""
-        if request.segmented_analysis or request.long_video_mode:
-            return self.run_long_video_analysis(request, progress_callback=progress_callback)
-        return self._run_single_analysis(request, progress_callback=progress_callback)
+        """Run the versioned pipeline while preserving the existing dispatch behavior."""
+        discovery_errors = plugin_registry.discover()
+        context: PipelineContext[AnalysisRequest, AnalysisResponse] = PipelineContext(
+            request=request,
+            services={"analysis_service": self},
+            metadata={
+                "schema_version": "1.0",
+                "segmented_analysis": bool(request.segmented_analysis or request.long_video_mode),
+                "adapters": {
+                    "action_model": "r2plus1d-v3",
+                    "tracker": request.tracker_backend or self.settings.tracker_backend,
+                    "identity": request.identity_embedding_backend or self.settings.identity_embedding_backend,
+                    "face_identity": self.settings.face_identity_backend,
+                    "scoreboard_ocr": self.settings.scoreboard_ocr_backend,
+                    "vlm": request.vlm_mode,
+                },
+                "checkpoint": getattr(self, "_model_provenance", {"status": "unknown"}),
+                "plugin_discovery_error_count": len(discovery_errors),
+            },
+        )
+
+        def validate(pipeline_context: PipelineContext[AnalysisRequest, AnalysisResponse]) -> None:
+            if not pipeline_context.request.video_path:
+                raise ValueError("Analysis request requires video_path")
+
+        def dispatch(pipeline_context: PipelineContext[AnalysisRequest, AnalysisResponse]) -> None:
+            if request.segmented_analysis or request.long_video_mode:
+                pipeline_context.result = self.run_long_video_analysis(
+                    request,
+                    progress_callback=progress_callback,
+                )
+            else:
+                pipeline_context.result = self._run_single_analysis(
+                    request,
+                    progress_callback=progress_callback,
+                )
+
+        def finalize(pipeline_context: PipelineContext[AnalysisRequest, AnalysisResponse]) -> None:
+            if pipeline_context.result is None:
+                raise RuntimeError("Analysis dispatch completed without a result")
+            pipeline_context.result.schema_version = "1.0"
+
+        stages = [
+            CallableStage("analysis.validate", validate),
+            *list_analysis_stages("before_dispatch"),
+            CallableStage("analysis.dispatch", dispatch),
+            *list_analysis_stages("after_dispatch"),
+            CallableStage("analysis.finalize", finalize),
+        ]
+        PipelineRunner(stages).run(context)
+        if context.result is None:  # defensive invariant for third-party stage work
+            raise RuntimeError("Analysis pipeline completed without a result")
+        context.result.pipeline_manifest = pipeline_manifest(context)
+        return context.result
 
     def _emit_progress(self, progress_callback: Optional[ProgressCallback], progress: int) -> None:
         if progress_callback is not None:
@@ -194,12 +267,21 @@ class AnalysisService:
             f"Cropping action windows: frames={len(video_frames)}, players={len(player_boxes[0]) if player_boxes else 0}, "
             f"seq_length={self.settings.seq_length}, vid_stride={effective_vid_stride}."
         )
-        player_clips = crop_windows(
+        crop_result = crop_windows(
             video_frames,
             player_boxes,
             seq_length=self.settings.seq_length,
             vid_stride=effective_vid_stride,
+            min_visible_ratio=0.25,
+            return_clip_indices=True,
         )
+        if isinstance(crop_result, tuple):
+            player_clips, player_clip_indices = crop_result
+        else:
+            player_clips = crop_result
+            player_clip_indices = {
+                player: list(range(len(clips))) for player, clips in player_clips.items()
+            }
         self._emit_progress(progress_callback, 45)
         
         # 3. Model Inference
@@ -239,7 +321,8 @@ class AnalysisService:
 
         for player, player_predictions in predictions.items():
             final_prediction_ids[player] = {}
-            for clip_index, prediction in enumerate(player_predictions):
+            for prediction_index, prediction in enumerate(player_predictions):
+                clip_index = player_clip_indices[player][prediction_index]
                 motion = compute_motion_features(
                     player_boxes,
                     player=player,
@@ -258,7 +341,7 @@ class AnalysisService:
                 ):
                     from app.analysis.vlm import select_keyframes
                     frames = select_keyframes(
-                        player_clips[player][clip_index], 
+                        player_clips[player][prediction_index],
                         max_frames=self.settings.vlm_frames
                     )
                     vlm_decision = verifier.verify(frames, prediction, motion)
@@ -518,12 +601,24 @@ class AnalysisService:
 
             for feature in segment_result.player_identity_features:
                 local_player_id = f"segment_{segment['segment_id']}:player_{feature.player}"
+                segment_duration_value = max(0.001, float(segment["end_sec"]) - float(segment["start_sec"]))
+                tracked_frame_count = max(1, int(feature.end_frame) - int(feature.start_frame) + 1)
+                tracked_fps = tracked_frame_count / segment_duration_value
+                sampled_boxes = [
+                    {
+                        **sample,
+                        "time_sec": float(segment["start_sec"])
+                        + (float(sample.get("frame", 0.0)) - float(feature.start_frame)) / tracked_fps,
+                    }
+                    for sample in feature.sampled_boxes
+                ]
                 player_identity_features[local_player_id] = feature.model_copy(
                     update={
                         "segment_id": segment["segment_id"],
                         "local_player_id": local_player_id,
-                        "start_frame": int(feature.start_frame) + segment["start_frame"],
-                        "end_frame": int(feature.end_frame) + segment["start_frame"],
+                        "start_frame": int(segment["start_frame"] + round(feature.start_frame / tracked_fps * fps)),
+                        "end_frame": int(segment["start_frame"] + round(feature.end_frame / tracked_fps * fps)),
+                        "sampled_boxes": sampled_boxes,
                     }
                 )
 
@@ -1042,12 +1137,6 @@ class AnalysisService:
     ) -> ScoreboardSummaryResponse:
         if not request.scoreboard_audit:
             return ScoreboardSummaryResponse(enabled=False, status="disabled")
-        if verifier is None:
-            return ScoreboardSummaryResponse(
-                enabled=True,
-                status="vlm_not_configured",
-                notes=["Scoreboard audit requires a configured VLM verifier."],
-            )
 
         frames, times, frame_numbers = self._sample_scoreboard_audit_frames(
             request.video_path,
@@ -1057,20 +1146,89 @@ class AnalysisService:
             interval_sec=request.scoreboard_audit_interval_sec,
             max_frames=request.scoreboard_audit_max_frames,
         )
+        ocr_reader = self._get_scoreboard_ocr_reader()
+        if verifier is None and ocr_reader is None:
+            return ScoreboardSummaryResponse(
+                enabled=True,
+                status="vlm_not_configured",
+                notes=["Scoreboard audit requires a configured VLM verifier or OCR backend."],
+            )
         self._log_progress(
             f"Scoreboard audit start: samples={len(frames)}, duration={duration_sec:.1f}s."
         )
         checkpoints: List[ScoreboardCheckpointResponse] = []
         audit_statuses: List[str] = []
-        for frame, time_sec, frame_number in zip(frames, times, frame_numbers):
-            audit = verifier.audit_scoreboard_frames(
-                frames=[frame],
-                frame_times=[time_sec],
-                frame_numbers=[frame_number],
-                scope=f"full_video duration={duration_sec:.1f}s; independent burst evidence",
+        ocr_reads = (
+            [ocr_reader.read(frame) for frame in frames]
+            if ocr_reader is not None
+            else [None] * len(frames)
+        )
+        for time_sec, frame_number, ocr_read in zip(times, frame_numbers, ocr_reads):
+            if ocr_read is not None:
+                checkpoints.append(
+                    ScoreboardCheckpointResponse(
+                        time_sec=time_sec,
+                        frame=frame_number,
+                        visible=True,
+                        left_score=ocr_read.left_score,
+                        right_score=ocr_read.right_score,
+                        confidence=ocr_read.confidence,
+                        source=ocr_reader.method,
+                        notes=[ocr_read.evidence],
+                    )
+                )
+                audit_statuses.append("ocr_ok")
+        ocr_summary = self._reconcile_scoreboard_checkpoints(checkpoints)
+        if (
+            ocr_summary.status == "ok"
+            and ocr_summary.final_time_sec is not None
+            and ocr_summary.final_time_sec >= duration_sec * 0.85
+        ):
+            ocr_summary.notes.append(
+                "Published late-video deterministic OCR consensus before VLM fallback."
             )
-            checkpoints.extend(audit.checkpoints)
-            audit_statuses.append(audit.status)
+            return ocr_summary
+
+        if verifier is None:
+            audit_statuses.append("vlm_not_configured")
+        else:
+            grouped_indices: Dict[float, List[int]] = defaultdict(list)
+            for index, time_sec in enumerate(times):
+                if self._scoreboard_crop_has_separable_score_digits(frames[index]):
+                    grouped_indices[round(time_sec, 1)].append(index)
+                else:
+                    audit_statuses.append("rolling_shutter_or_occluded")
+            for anchor_time, indices in sorted(grouped_indices.items()):
+                unique_indices: List[int] = []
+                seen_frames: set[int] = set()
+                for index in indices:
+                    frame_number = int(frame_numbers[index])
+                    if frame_number in seen_frames:
+                        continue
+                    seen_frames.add(frame_number)
+                    unique_indices.append(index)
+                    if len(unique_indices) >= 4:
+                        break
+                if not unique_indices:
+                    continue
+                is_phase_group = len(unique_indices) >= 2
+                prior_context = self._scoreboard_prior_context(checkpoints, anchor_time)
+                audit = verifier.audit_scoreboard_frames(
+                    frames=[frames[index] for index in unique_indices],
+                    frame_times=[times[index] for index in unique_indices],
+                    frame_numbers=[frame_numbers[index] for index in unique_indices],
+                    scope=(
+                        f"same-anchor rolling-shutter phase comparison at t={anchor_time:.1f}s; "
+                        f"compare complementary LED phases jointly{prior_context}"
+                        if is_phase_group
+                        else (
+                            f"full_video duration={duration_sec:.1f}s; independent burst evidence"
+                            f"{prior_context}"
+                        )
+                    ),
+                )
+                checkpoints.extend(audit.checkpoints)
+                audit_statuses.append(audit.status)
         summary = self._reconcile_scoreboard_checkpoints(checkpoints)
         if summary.status == "inconsistent_scoreboard":
             conflict = self._latest_scoreboard_conflict(checkpoints)
@@ -1113,6 +1271,82 @@ class AnalysisService:
         )
         return summary
 
+    def _scoreboard_prior_context(
+        self,
+        checkpoints: List[ScoreboardCheckpointResponse],
+        anchor_time: float,
+    ) -> str:
+        """Describe an earlier reconciled score as a visual-reading constraint."""
+        earlier = [
+            checkpoint
+            for checkpoint in checkpoints
+            if checkpoint.time_sec < float(anchor_time) - 1.0
+        ]
+        if not earlier:
+            return ""
+        prior = self._reconcile_scoreboard_checkpoints(earlier)
+        if (
+            prior.status != "ok"
+            or prior.final_left_score is None
+            or prior.final_right_score is None
+            or prior.final_time_sec is None
+        ):
+            return ""
+        elapsed = max(0.0, float(anchor_time) - float(prior.final_time_sec))
+        max_total_jump = max(12.0, elapsed * 0.35)
+        return (
+            f". Earlier reconciled scoreboard at t={prior.final_time_sec:.1f}s was "
+            f"left {prior.final_left_score}, right {prior.final_right_score}. Current scores cannot decrease, "
+            f"and a total increase greater than {max_total_jump:.0f} points in {elapsed:.1f}s is physically "
+            "implausible. Use this only to reject impossible visual interpretations; do not infer points "
+            "from game action"
+        )
+
+    def _scoreboard_crop_has_separable_score_digits(self, frame: np.ndarray) -> bool:
+        """Require distinct large cyan digit regions on both scoreboard sides."""
+        if frame.size == 0:
+            return False
+        height, width = frame.shape[:2]
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        hue, saturation, value = cv2.split(hsv)
+        cyan = (
+            ((hue >= 42) & (hue < 110) & (saturation > 50) & (value > 120))
+        ).astype(np.uint8)
+        component_count, _, stats, _ = cv2.connectedComponentsWithStats(cyan, connectivity=8)
+        score_region_centers: List[float] = []
+        for index in range(1, component_count):
+            x, y, component_width, component_height, area = [int(item) for item in stats[index]]
+            if area < width * height * 0.0008:
+                continue
+            center_x = x + component_width / 2.0
+            center_y = y + component_height / 2.0
+            aspect_ratio = component_width / max(1.0, float(component_height))
+            if (
+                component_height < height * 0.09
+                or component_height > height * 0.36
+                or not height * 0.30 <= center_y <= height * 0.70
+                or not 0.25 <= aspect_ratio <= 3.3
+            ):
+                continue
+            score_region_centers.append(center_x)
+        return any(
+            right_center - left_center >= width * 0.20
+            for left_center in score_region_centers
+            for right_center in score_region_centers
+            if left_center < right_center
+        )
+
+    def _get_scoreboard_ocr_reader(self) -> Optional[RapidOCRScoreboardReader]:
+        backend_value = getattr(self.settings, "scoreboard_ocr_backend", "rapidocr_if_available")
+        backend = backend_value if isinstance(backend_value, str) else "rapidocr_if_available"
+        confidence_value = getattr(self.settings, "scoreboard_ocr_confidence", 0.75)
+        confidence = float(confidence_value) if isinstance(confidence_value, (int, float)) else 0.75
+        key = (backend, confidence)
+        if self._scoreboard_ocr_key != key:
+            self._scoreboard_ocr_reader = build_scoreboard_ocr_reader(backend, confidence)
+            self._scoreboard_ocr_key = key
+        return self._scoreboard_ocr_reader
+
     def _sample_scoreboard_audit_frames(
         self,
         video_path: str,
@@ -1124,7 +1358,7 @@ class AnalysisService:
     ) -> tuple[List[np.ndarray], List[float], List[int]]:
         max_frames = max(1, int(max_frames or 1))
         duration_sec = max(0.0, float(duration_sec))
-        scan_step = min(max(1.0, float(interval_sec or 120.0) / 20.0), max(0.5, duration_sec / 320.0))
+        scan_step = min(max(0.5, float(interval_sec or 120.0) / 60.0), max(0.5, duration_sec / 1800.0))
         cap = cv2.VideoCapture(video_path)
         frames: List[np.ndarray] = []
         times: List[float] = []
@@ -1142,15 +1376,16 @@ class AnalysisService:
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     continue
-                score, box = self._score_scoreboard_candidate(frame)
-                if box is not None:
-                    candidates.append({"time_sec": float(time_sec), "score": float(score), "box": box})
+                for score, box in self._score_scoreboard_candidates(frame, max_candidates=4):
+                    if self._scoreboard_box_is_complete(box, frame.shape[1]):
+                        candidates.append({"time_sec": float(time_sec), "score": float(score), "box": box})
 
             selected = self._select_scoreboard_candidates(candidates, max_frames=max_frames)
             for candidate in selected:
                 variants = self._build_scoreboard_burst_variants(
                     cap=cap,
                     anchor_time_sec=float(candidate["time_sec"]),
+                    anchor_box=candidate["box"],
                     fps=fps,
                     frame_count=frame_count,
                 )
@@ -1166,6 +1401,14 @@ class AnalysisService:
         self,
         frame: np.ndarray,
     ) -> tuple[float, Optional[tuple[int, int, int, int]]]:
+        candidates = self._score_scoreboard_candidates(frame, max_candidates=1)
+        return candidates[0] if candidates else (0.0, None)
+
+    def _score_scoreboard_candidates(
+        self,
+        frame: np.ndarray,
+        max_candidates: int = 4,
+    ) -> List[tuple[float, tuple[int, int, int, int]]]:
         height, width = frame.shape[:2]
         target_width = 640
         scale = target_width / max(1, width)
@@ -1176,39 +1419,171 @@ class AnalysisService:
         yellow = ((hue >= 12) & (hue < 42) & (saturation > 90) & (value > 130)).astype(np.float32)
         green = ((hue >= 42) & (hue < 110) & (saturation > 60) & (value > 120)).astype(np.float32)
         led = np.maximum.reduce([red, yellow, green])
-        dark = (value < 135).astype(np.float32)
 
-        best_score = 0.0
-        best_box: Optional[tuple[int, int, int, int]] = None
+        dark_panel = (value < 120).astype(np.uint8) * 255
+        dark_panel = cv2.morphologyEx(
+            dark_panel,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3)),
+        )
+        contours, _ = cv2.findContours(dark_panel, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         resized_height, resized_width = resized.shape[:2]
-        for window_width, window_height in ((96, 48), (128, 64), (160, 80)):
-            area = float(window_width * window_height)
-            led_sum = cv2.boxFilter(led, -1, (window_width, window_height), normalize=False)
-            dark_ratio = cv2.boxFilter(dark, -1, (window_width, window_height), normalize=False) / area
-            color_count = sum(
-                cv2.boxFilter(mask, -1, (window_width, window_height), normalize=False) >= 4
+        panel_candidates: List[tuple[float, tuple[int, int, int, int]]] = []
+        inverse_scale = 1.0 / scale
+        for contour in contours:
+            x, y, panel_width, panel_height = cv2.boundingRect(contour)
+            aspect_ratio = panel_width / max(1.0, float(panel_height))
+            if (
+                panel_width < resized_width * 0.11
+                or panel_height < resized_height * 0.07
+                or y > resized_height * 0.70
+                or not 1.35 <= aspect_ratio <= 4.5
+            ):
+                continue
+            panel_dark_ratio = float((dark_panel[y : y + panel_height, x : x + panel_width] > 0).mean())
+            panel_saturation = saturation[y : y + panel_height, x : x + panel_width]
+            panel_saturation_mean = float(panel_saturation.mean())
+            panel_led = led[y : y + panel_height, x : x + panel_width]
+            led_count = float(panel_led.sum())
+            panel_color_count = sum(
+                float(mask[y : y + panel_height, x : x + panel_width].sum()) >= 8.0
                 for mask in (red, yellow, green)
             )
-            score_map = led_sum * (0.4 + dark_ratio) * (1.0 + 0.35 * np.maximum(0, color_count - 1))
-            score_map[: min(32, resized_height), :] = 0
-            score_map[max(0, resized_height - 32) :, :] = 0
-            _, max_value, _, max_location = cv2.minMaxLoc(score_map)
-            if max_value <= best_score:
+            if (
+                panel_dark_ratio < 0.35
+                or panel_saturation_mean > 55.0
+                or led_count < 15.0
+                or panel_color_count < 2
+            ):
                 continue
-            center_x, center_y = max_location
-            x = max(0, min(resized_width - window_width, center_x - window_width // 2))
-            y = max(0, min(resized_height - window_height, center_y - window_height // 2))
-            inverse_scale = 1.0 / scale
-            best_score = float(max_value)
-            best_box = (
-                int(round(x * inverse_scale)),
-                int(round(y * inverse_scale)),
-                int(round(window_width * inverse_scale)),
-                int(round(window_height * inverse_scale)),
+            led_cluster_mask = cv2.dilate(
+                (panel_led > 0).astype(np.uint8) * 255,
+                cv2.getStructuringElement(cv2.MORPH_RECT, (21, 11)),
             )
-        if best_score < 150.0:
-            return 0.0, None
-        return best_score, best_box
+            led_contours, _ = cv2.findContours(
+                led_cluster_mask,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
+            )
+            led_regions: List[tuple[float, tuple[int, int, int, int]]] = []
+            for led_contour in led_contours:
+                led_left, led_top, led_width, led_height = cv2.boundingRect(led_contour)
+                if led_width / max(1.0, float(led_height)) < 1.2:
+                    continue
+                region = panel_led[led_top : led_top + led_height, led_left : led_left + led_width]
+                led_regions.append((float(region.sum()), (led_left, led_top, led_width, led_height)))
+            if not led_regions:
+                continue
+            _, (cluster_left, cluster_top, cluster_width, cluster_height) = max(
+                led_regions,
+                key=lambda item: item[0],
+            )
+            cluster = panel_led[
+                cluster_top : cluster_top + cluster_height,
+                cluster_left : cluster_left + cluster_width,
+            ]
+            led_y, led_x = np.where(cluster > 0)
+            pad_x = max(6, int(panel_width * 0.06))
+            pad_y = max(4, int(panel_height * 0.08))
+            refined_left = max(x, x + cluster_left + int(led_x.min()) - pad_x)
+            refined_top = max(y, y + cluster_top + int(led_y.min()) - pad_y)
+            refined_right = min(x + panel_width, x + cluster_left + int(led_x.max()) + pad_x + 1)
+            refined_bottom = min(y + panel_height, y + cluster_top + int(led_y.max()) + pad_y + 1)
+            panel_candidates.append(
+                (
+                    led_count * panel_dark_ratio * (1.0 + 0.25 * panel_color_count),
+                    (
+                        int(round(refined_left * inverse_scale)),
+                        int(round(refined_top * inverse_scale)),
+                        int(round((refined_right - refined_left) * inverse_scale)),
+                        int(round((refined_bottom - refined_top) * inverse_scale)),
+                    ),
+                )
+            )
+        # Occlusion or motion blur can split the dark cabinet contour while the
+        # sparse, multi-color LED layout remains distinctive.
+        led_cluster_mask = cv2.dilate(
+            (led > 0).astype(np.uint8) * 255,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (31, 17)),
+        )
+        led_contours, _ = cv2.findContours(
+            led_cluster_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        for contour in led_contours:
+            x, y, cluster_width, cluster_height = cv2.boundingRect(contour)
+            aspect_ratio = cluster_width / max(1.0, float(cluster_height))
+            if (
+                cluster_width < resized_width * 0.08
+                or cluster_height < resized_height * 0.05
+                or y > resized_height * 0.70
+                or not 1.4 <= aspect_ratio <= 5.5
+            ):
+                continue
+            cluster_led = led[y : y + cluster_height, x : x + cluster_width]
+            led_count = float(cluster_led.sum())
+            color_count = sum(
+                float(mask[y : y + cluster_height, x : x + cluster_width].sum()) >= 8.0
+                for mask in (red, yellow, green)
+            )
+            led_fill = led_count / max(1.0, float(cluster_width * cluster_height))
+            context_left = max(0, x - cluster_width // 8)
+            context_top = max(0, y - cluster_height // 6)
+            context_right = min(resized_width, x + cluster_width + cluster_width // 8)
+            context_bottom = min(resized_height, y + cluster_height + cluster_height // 6)
+            context_value = value[context_top:context_bottom, context_left:context_right]
+            context_dark_ratio = float((context_value < 150).mean())
+            if (
+                color_count < 3
+                or led_count < 80.0
+                or not 0.01 <= led_fill <= 0.30
+                or context_dark_ratio < 0.18
+            ):
+                continue
+            led_y, led_x = np.where(cluster_led > 0)
+            pad_x = max(6, int(cluster_width * 0.08))
+            pad_y = max(4, int(cluster_height * 0.12))
+            refined_left = max(0, x + int(led_x.min()) - pad_x)
+            refined_top = max(0, y + int(led_y.min()) - pad_y)
+            refined_right = min(resized_width, x + int(led_x.max()) + pad_x + 1)
+            refined_bottom = min(resized_height, y + int(led_y.max()) + pad_y + 1)
+            panel_candidates.append(
+                (
+                    led_count * context_dark_ratio * (1.0 + 0.25 * color_count),
+                    (
+                        int(round(refined_left * inverse_scale)),
+                        int(round(refined_top * inverse_scale)),
+                        int(round((refined_right - refined_left) * inverse_scale)),
+                        int(round((refined_bottom - refined_top) * inverse_scale)),
+                    ),
+                )
+            )
+
+        deduplicated: List[tuple[float, tuple[int, int, int, int]]] = []
+        for candidate in sorted(panel_candidates, key=lambda item: item[0], reverse=True):
+            _, box = candidate
+            center = (box[0] + box[2] / 2.0, box[1] + box[3] / 2.0)
+            if any(
+                abs(center[0] - (existing[1][0] + existing[1][2] / 2.0))
+                <= max(box[2], existing[1][2]) * 0.35
+                and abs(center[1] - (existing[1][1] + existing[1][3] / 2.0))
+                <= max(box[3], existing[1][3]) * 0.35
+                for existing in deduplicated
+            ):
+                continue
+            deduplicated.append(candidate)
+            if len(deduplicated) >= max_candidates:
+                break
+        return deduplicated
+
+    def _scoreboard_box_is_complete(
+        self,
+        box: tuple[int, int, int, int],
+        frame_width: int,
+    ) -> bool:
+        margin = max(2, int(frame_width * 0.005))
+        return box[0] > margin and box[0] + box[2] < frame_width - margin
 
     def _select_scoreboard_candidates(
         self,
@@ -1218,43 +1593,152 @@ class AnalysisService:
         if not candidates:
             return []
         eligible = [candidate for candidate in candidates if float(candidate["score"]) >= 150.0]
+        if not eligible:
+            return []
+
+        times = [float(candidate["time_sec"]) for candidate in eligible]
+        scores = np.array([float(candidate["score"]) for candidate in eligible], dtype=np.float32)
+        min_time = min(times)
+        time_span = max(1.0, max(times) - min_time)
+        score_ceiling = max(1.0, float(np.percentile(scores, 95)))
+        quality_floor = float(np.percentile(scores, 55))
+
+        def ranking_score(candidate: Dict[str, Any]) -> float:
+            time_sec = float(candidate["time_sec"])
+            raw_score = float(candidate["score"])
+            x, y, width, height = candidate["box"]
+            center_x = x + width / 2.0
+            edge_bonus = 1.0 if center_x <= width * 1.75 or x <= 0 else 0.0
+            edge_bonus = max(edge_bonus, 1.0 if x >= width * 3.0 else 0.0)
+            nearby = 0
+            for other in eligible:
+                if other is candidate or abs(float(other["time_sec"]) - time_sec) > 4.0:
+                    continue
+                ox, oy, ow, oh = other["box"]
+                if (
+                    abs((ox + ow / 2.0) - center_x) <= max(width, ow) * 0.9
+                    and abs((oy + oh / 2.0) - (y + height / 2.0)) <= max(height, oh) * 0.9
+                ):
+                    nearby += 1
+            stability = min(1.0, nearby / 2.0)
+            quality = min(1.0, raw_score / score_ceiling)
+            recency = (time_sec - min_time) / time_span
+            return quality * 0.55 + recency * 0.25 + stability * 0.15 + edge_bonus * 0.05
+
+        qualified_floor = max(150.0, quality_floor * 0.75)
+        ranked = sorted(
+            (candidate for candidate in eligible if float(candidate["score"]) >= qualified_floor),
+            key=ranking_score,
+            reverse=True,
+        )
         selected: List[Dict[str, Any]] = []
-        for candidate in sorted(eligible, key=lambda item: float(item["time_sec"]), reverse=True):
-            if all(abs(float(candidate["time_sec"]) - float(item["time_sec"])) >= 3.0 for item in selected):
+        high_quality_slots = max(1, max_frames - 1)
+        # Preserve the strongest raw visual candidate from the final fifth of
+        # the observed candidate timeline. A distant but genuine terminal board
+        # can score below a global percentile dominated by earlier close-ups,
+        # while still being much stronger than other tail detections.
+        late_cutoff = min_time + time_span * 0.80
+        late_candidates = [
+            candidate for candidate in eligible if float(candidate["time_sec"]) >= late_cutoff
+        ]
+        if late_candidates:
+            selected.append(max(late_candidates, key=lambda item: float(item["score"])))
+        # Fill the main budget by evidence quality, not simply by walking
+        # backwards from the end. A run of weak late false panels must not
+        # crowd out a slightly earlier, much stronger terminal scoreboard.
+        # Temporal diversity still prevents one appearance burst consuming
+        # every slot; the separate rescue slot below preserves the latest
+        # eligible candidate even when its visual quality is weak.
+        for candidate in ranked:
+            if candidate in selected:
+                continue
+            if all(
+                abs(float(candidate["time_sec"]) - float(item["time_sec"])) >= 6.0
+                for item in selected
+            ):
+                selected.append(candidate)
+                if len(selected) >= high_quality_slots:
+                    break
+
+        # Preserve one very-late rescue candidate even when its visual score is
+        # below the quality percentile. It can recover a brief final scoreboard
+        # appearance without allowing weak tail detections to consume most slots.
+        if len(selected) < max_frames:
+            for candidate in sorted(eligible, key=lambda item: float(item["time_sec"]), reverse=True):
+                if candidate in selected:
+                    continue
+                if all(abs(float(candidate["time_sec"]) - float(item["time_sec"])) >= 6.0 for item in selected):
+                    selected.append(candidate)
+                    break
+        for candidate in sorted(eligible, key=ranking_score, reverse=True):
+            if len(selected) >= max_frames:
+                break
+            if candidate in selected:
+                continue
+            if all(abs(float(candidate["time_sec"]) - float(item["time_sec"])) >= 6.0 for item in selected):
                 selected.append(candidate)
                 if len(selected) >= max_frames:
                     break
-        if len(selected) < max_frames:
-            for candidate in sorted(candidates, key=lambda item: float(item["score"]), reverse=True):
-                if candidate in selected:
-                    continue
-                if all(abs(float(candidate["time_sec"]) - float(item["time_sec"])) >= 2.0 for item in selected):
-                    selected.append(candidate)
-                    if len(selected) >= max_frames:
-                        break
         return sorted(selected, key=lambda item: float(item["time_sec"]))
 
     def _build_scoreboard_burst_variants(
         self,
         cap: cv2.VideoCapture,
         anchor_time_sec: float,
+        anchor_box: tuple[int, int, int, int],
         fps: float,
         frame_count: int,
     ) -> List[tuple[np.ndarray, float, int]]:
         burst: List[tuple[float, int, float, tuple[int, int, int, int], np.ndarray]] = []
-        for offset in (-0.4, -0.2, 0.0, 0.2, 0.4):
-            time_sec = max(0.0, anchor_time_sec + offset)
-            frame_number = min(max(0, int(round(time_sec * fps))), max(0, frame_count - 1))
+        anchor_frame_number = min(max(0, int(round(anchor_time_sec * fps))), max(0, frame_count - 1))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, anchor_frame_number)
+        anchor_ok, anchor_frame_image = cap.read()
+        if not anchor_ok or anchor_frame_image is None:
+            return []
+        burst_radius = self._scoreboard_burst_radius_frames(fps)
+        for frame_delta in range(-burst_radius, burst_radius + 1):
+            frame_number = min(max(0, anchor_frame_number + frame_delta), max(0, frame_count - 1))
+            time_sec = frame_number / max(1.0, fps)
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
             ok, frame = cap.read()
             if not ok or frame is None:
                 continue
-            score, box = self._score_scoreboard_candidate(frame)
-            if box is not None:
-                burst.append((score, frame_number, time_sec, box, frame))
+            tracked_box = self._resolve_scoreboard_burst_box(
+                frame=frame,
+                anchor_frame=anchor_frame_image,
+                anchor_box=anchor_box,
+            )
+            crop = self._crop_scoreboard_panel(frame, tracked_box)
+            normalized_probe = cv2.resize(crop, (600, 210), interpolation=cv2.INTER_CUBIC)
+            has_separable_digits = self._scoreboard_crop_has_separable_score_digits(normalized_probe)
+            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+            hue, saturation, value = cv2.split(hsv)
+            led = (
+                (((hue < 42) | ((hue >= 42) & (hue < 110))) & (saturation > 60) & (value > 120))
+            )
+            led_density = float(led.mean()) * (0.5 + float((value < 135).mean()))
+            sharpness = float(
+                cv2.Laplacian(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var()
+            )
+            side_spans: List[float] = []
+            for side_mask in (led[:, : led.shape[1] // 3], led[:, -led.shape[1] // 3 :]):
+                side_y, _ = np.where(side_mask)
+                side_spans.append(
+                    (float(side_y.max() - side_y.min() + 1) / max(1, side_mask.shape[0]))
+                    if side_y.size
+                    else 0.0
+                )
+            readability = (
+                led_density
+                + 0.30 * min(1.0, sharpness / 1000.0)
+                + 0.80 * min(side_spans)
+                + (3.0 if has_separable_digits else 0.0)
+            )
+            burst.append((readability, frame_number, time_sec, tracked_box, frame))
         if not burst:
             return []
 
+        boundary_samples = [burst[0], burst[-1]]
         burst.sort(key=lambda item: item[0], reverse=True)
         best = burst[0]
         best_center = (best[3][0] + best[3][2] / 2.0, best[3][1] + best[3][3] / 2.0)
@@ -1265,26 +1749,211 @@ class AnalysisService:
             and abs((item[3][1] + item[3][3] / 2.0) - best_center[1]) <= item[4].shape[0] * 0.14
             and item[0] >= best[0] * 0.3
         ]
-        sharp = aligned[:1] if aligned else burst[:1]
+        ranked_source = aligned if aligned else burst
+        sharp = [ranked_source[0]]
+        for item in boundary_samples:
+            if all(item[1] != existing[1] for existing in sharp):
+                sharp.append(item)
+        for item in ranked_source:
+            if len(sharp) >= 3:
+                break
+            if all(item[1] != existing[1] for existing in sharp):
+                sharp.append(item)
+        central_burst = sorted(
+            (
+                item
+                for item in burst
+                if abs(int(item[1]) - anchor_frame_number) <= 6
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        for item in central_burst[:3]:
+            if all(item[1] != existing[1] for existing in sharp):
+                sharp.append(item)
         variants: List[tuple[np.ndarray, float, int]] = []
         anchor_time = float(best[2])
         anchor_frame = int(best[1])
-        for _, _, _, box, frame in sharp:
+        for _, sample_frame, _, box, frame in sharp:
             crop = self._crop_scoreboard_panel(frame, box)
             normalized = cv2.resize(crop, (1200, 420), interpolation=cv2.INTER_CUBIC)
-            variants.append((normalized, anchor_time, anchor_frame))
-        fusion_source = sorted(aligned if len(aligned) >= 3 else burst, key=lambda item: item[2])
+            variants.append((normalized, anchor_time, int(sample_frame)))
+        for _, sample_frame, _, box, frame in boundary_samples:
+            crop = self._crop_scoreboard_panel(frame, box)
+            normalized = cv2.resize(crop, (1200, 420), interpolation=cv2.INTER_CUBIC)
+            blurred = cv2.GaussianBlur(normalized, (0, 0), 1.2)
+            sharpened = cv2.addWeighted(normalized, 1.7, blurred, -0.7, 0)
+            variants.append((sharpened, anchor_time, int(sample_frame)))
+        if central_burst:
+            central_boundaries = [
+                min(central_burst, key=lambda item: item[1]),
+                max(central_burst, key=lambda item: item[1]),
+            ]
+            for _, sample_frame, _, box, frame in central_boundaries:
+                crop = self._crop_scoreboard_panel(frame, box)
+                normalized = cv2.resize(crop, (1200, 420), interpolation=cv2.INTER_CUBIC)
+                blurred = cv2.GaussianBlur(normalized, (0, 0), 1.2)
+                sharpened = cv2.addWeighted(normalized, 1.7, blurred, -0.7, 0)
+                variants.append((sharpened, anchor_time, int(sample_frame)))
+        fusion_source = sorted((aligned if len(aligned) >= 3 else burst)[:7], key=lambda item: item[2])
         fusion_crops = [
             cv2.resize(self._crop_scoreboard_panel(item[4], item[3]), (1200, 420), interpolation=cv2.INTER_CUBIC)
             for item in fusion_source
         ]
         if fusion_crops:
             stacked = np.stack(fusion_crops)
-            stable_fusion = np.percentile(stacked, 65, axis=0).astype(np.uint8)
             percentile_fusion = np.percentile(stacked, 75, axis=0).astype(np.uint8)
-            variants.append((stable_fusion, anchor_time, anchor_frame))
             variants.append((percentile_fusion, anchor_time, anchor_frame))
+        central_fusion_crops = [
+            cv2.resize(self._crop_scoreboard_panel(item[4], item[3]), (1200, 420), interpolation=cv2.INTER_CUBIC)
+            for item in central_burst[:7]
+        ]
+        if central_fusion_crops:
+            central_fusion = np.percentile(
+                np.stack(central_fusion_crops),
+                75,
+                axis=0,
+            ).astype(np.uint8)
+            variants.append((central_fusion, anchor_time, anchor_frame))
         return variants
+
+    def _scoreboard_burst_radius_frames(self, fps: float) -> int:
+        """Cover enough time to cross a full LED rolling-shutter phase."""
+        return max(6, int(round(max(1.0, float(fps)) * 0.60)))
+
+    def _resolve_scoreboard_burst_box(
+        self,
+        frame: np.ndarray,
+        anchor_frame: np.ndarray,
+        anchor_box: tuple[int, int, int, int],
+    ) -> tuple[int, int, int, int]:
+        fresh_candidates = [
+            candidate
+            for candidate in self._score_scoreboard_candidates(frame, max_candidates=2)
+            if self._scoreboard_box_is_complete(candidate[1], frame.shape[1])
+        ]
+        tracked_box = self._track_scoreboard_template(frame, anchor_frame, anchor_box)
+        if fresh_candidates:
+            fresh_box = fresh_candidates[0][1]
+            if tracked_box is None:
+                return fresh_box
+            fresh_center = (
+                fresh_box[0] + fresh_box[2] / 2.0,
+                fresh_box[1] + fresh_box[3] / 2.0,
+            )
+            tracked_center = (
+                tracked_box[0] + tracked_box[2] / 2.0,
+                tracked_box[1] + tracked_box[3] / 2.0,
+            )
+            displacement = (
+                (fresh_center[0] - tracked_center[0]) ** 2
+                + (fresh_center[1] - tracked_center[1]) ** 2
+            ) ** 0.5
+            if displacement > max(fresh_box[2], tracked_box[2]) * 1.25:
+                return fresh_box
+            return tracked_box
+        return (
+            tracked_box
+            or self._locate_scoreboard_leds_near_box(frame, anchor_box)
+            or anchor_box
+        )
+
+    def _track_scoreboard_template(
+        self,
+        frame: np.ndarray,
+        anchor_frame: np.ndarray,
+        anchor_box: tuple[int, int, int, int],
+    ) -> Optional[tuple[int, int, int, int]]:
+        height, width = frame.shape[:2]
+        x, y, box_width, box_height = anchor_box
+        template_left = max(0, int(x - box_width * 0.25))
+        template_top = max(0, int(y - box_height * 0.40))
+        template_right = min(width, int(x + box_width * 1.25))
+        template_bottom = min(height, int(y + box_height * 1.40))
+        template = anchor_frame[template_top:template_bottom, template_left:template_right]
+        if template.size == 0:
+            return None
+        search_left = max(0, template_left - int(width * 0.20))
+        search_right = min(width, template_right + int(width * 0.20))
+        search_top = max(0, template_top - int(height * 0.10))
+        search_bottom = min(height, template_bottom + int(height * 0.10))
+        search = frame[search_top:search_bottom, search_left:search_right]
+        if search.shape[0] < template.shape[0] or search.shape[1] < template.shape[1]:
+            return None
+        template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+        search_gray = cv2.cvtColor(search, cv2.COLOR_BGR2GRAY)
+        result = cv2.matchTemplate(search_gray, template_gray, cv2.TM_CCOEFF_NORMED)
+        _, score, _, location = cv2.minMaxLoc(result)
+        if score < 0.25:
+            return None
+        matched_left = search_left + location[0]
+        matched_top = search_top + location[1]
+        dx = matched_left - template_left
+        dy = matched_top - template_top
+        return (
+            max(0, min(width - box_width, x + dx)),
+            max(0, min(height - box_height, y + dy)),
+            box_width,
+            box_height,
+        )
+
+    def _locate_scoreboard_leds_near_box(
+        self,
+        frame: np.ndarray,
+        anchor_box: tuple[int, int, int, int],
+    ) -> Optional[tuple[int, int, int, int]]:
+        height, width = frame.shape[:2]
+        x, y, box_width, box_height = anchor_box
+        left = max(0, int(x - box_width * 1.5))
+        right = min(width, int(x + box_width * 2.5))
+        top = max(0, int(y - box_height * 1.5))
+        bottom = min(height, int(y + box_height * 2.5))
+        roi = frame[top:bottom, left:right]
+        if roi.size == 0:
+            return None
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        hue, saturation, value = cv2.split(hsv)
+        masks = [
+            (((hue < 12) | (hue > 170)) & (saturation > 90) & (value > 130)),
+            ((hue >= 12) & (hue < 42) & (saturation > 90) & (value > 130)),
+            ((hue >= 42) & (hue < 110) & (saturation > 60) & (value > 120)),
+        ]
+        led = np.maximum.reduce(masks).astype(np.uint8)
+        clustered = cv2.dilate(
+            led * 255,
+            cv2.getStructuringElement(
+                cv2.MORPH_RECT,
+                (max(15, box_width // 4), max(7, box_height // 3)),
+            ),
+        )
+        contours, _ = cv2.findContours(clustered, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        candidates: List[tuple[float, tuple[int, int, int, int]]] = []
+        for contour in contours:
+            cx, cy, cw, ch = cv2.boundingRect(contour)
+            if cw / max(1.0, float(ch)) < 1.2:
+                continue
+            region = led[cy : cy + ch, cx : cx + cw]
+            color_count = sum(int(mask[cy : cy + ch, cx : cx + cw].sum()) >= 8 for mask in masks)
+            if color_count < 2 or int(region.sum()) < 20:
+                continue
+            candidates.append((float(region.sum()), (cx, cy, cw, ch)))
+        if not candidates:
+            return None
+        _, (cx, cy, cw, ch) = max(candidates, key=lambda item: item[0])
+        region = led[cy : cy + ch, cx : cx + cw]
+        led_y, led_x = np.where(region > 0)
+        pad_x = max(8, int(box_width * 0.08))
+        pad_y = max(5, int(box_height * 0.10))
+        refined_left = max(0, left + cx + int(led_x.min()) - pad_x)
+        refined_top = max(0, top + cy + int(led_y.min()) - pad_y)
+        refined_right = min(width, left + cx + int(led_x.max()) + pad_x + 1)
+        refined_bottom = min(height, top + cy + int(led_y.max()) + pad_y + 1)
+        return (
+            refined_left,
+            refined_top,
+            max(1, refined_right - refined_left),
+            max(1, refined_bottom - refined_top),
+        )
 
     def _crop_scoreboard_panel(
         self,
@@ -1295,8 +1964,8 @@ class AnalysisService:
         x, y, box_width, box_height = box
         center_x = x + box_width / 2.0
         center_y = y + box_height / 2.0
-        crop_width = min(width, max(box_width * 2.0, width * 0.38))
-        crop_height = min(height, max(box_height * 1.8, crop_width / 2.4, height * 0.2))
+        crop_width = min(width, max(box_width * 1.35, width * 0.14))
+        crop_height = min(height, max(box_height * 1.35, crop_width / 2.2, height * 0.12))
         left = int(round(center_x - crop_width / 2.0))
         top = int(round(center_y - crop_height / 2.0))
         left = max(0, min(width - int(crop_width), left))
@@ -1307,30 +1976,169 @@ class AnalysisService:
         self,
         checkpoints: List[ScoreboardCheckpointResponse],
     ) -> ScoreboardSummaryResponse:
+        partial_grouped: Dict[float, List[ScoreboardCheckpointResponse]] = defaultdict(list)
+        for checkpoint in checkpoints:
+            if checkpoint.visible and checkpoint.confidence >= 0.65:
+                partial_grouped[round(checkpoint.time_sec, 1)].append(checkpoint)
+
+        component_fusions: List[ScoreboardCheckpointResponse] = []
+        for time_sec, group in sorted(partial_grouped.items()):
+            side_candidates: Dict[str, Dict[int, Dict[str, Any]]] = {
+                "left": defaultdict(lambda: {"count": 0, "weight": 0.0, "confidence": 0.0}),
+                "right": defaultdict(lambda: {"count": 0, "weight": 0.0, "confidence": 0.0}),
+            }
+            for checkpoint in group:
+                values = {
+                    "left": checkpoint.left_score,
+                    "right": checkpoint.right_score,
+                }
+                complete_values = [value for value in values.values() if value is not None]
+                truncated_side_value: Optional[int] = None
+                if (
+                    len(complete_values) == 2
+                    and max(int(value) for value in complete_values) >= 30
+                    and min(int(value) for value in complete_values) < 10
+                ):
+                    truncated_side_value = min(int(value) for value in complete_values)
+                for side, raw_value in values.items():
+                    if raw_value is None:
+                        continue
+                    value = int(raw_value)
+                    if truncated_side_value is not None and value == truncated_side_value:
+                        continue
+                    evidence = side_candidates[side][value]
+                    evidence["count"] += 1
+                    evidence["weight"] += (
+                        2.0 if checkpoint.source.startswith("rapidocr_scoreboard") else 1.0
+                    )
+                    evidence["confidence"] = max(
+                        float(evidence["confidence"]),
+                        float(checkpoint.confidence),
+                    )
+
+            selected_sides: Dict[str, tuple[int, Dict[str, Any]]] = {}
+            for side, candidates in side_candidates.items():
+                if not candidates:
+                    continue
+                selected_sides[side] = max(
+                    candidates.items(),
+                    key=lambda item: (
+                        int(item[1]["count"]),
+                        float(item[1]["weight"]),
+                        float(item[1]["confidence"]),
+                    ),
+                )
+            if set(selected_sides) != {"left", "right"}:
+                continue
+            left_value, left_evidence = selected_sides["left"]
+            right_value, right_evidence = selected_sides["right"]
+            if any(
+                checkpoint.left_score == left_value and checkpoint.right_score == right_value
+                for checkpoint in group
+            ):
+                continue
+            support_count = int(left_evidence["count"]) + int(right_evidence["count"])
+            if support_count < 3:
+                continue
+            confidence = min(
+                float(left_evidence["confidence"]),
+                float(right_evidence["confidence"]),
+            )
+            component_fusions.append(
+                ScoreboardCheckpointResponse(
+                    time_sec=time_sec,
+                    frame=max((checkpoint.frame for checkpoint in group), default=0),
+                    visible=True,
+                    left_score=left_value,
+                    right_score=right_value,
+                    confidence=confidence,
+                    source="scoreboard_component_fusion_v1",
+                    notes=[
+                        "Fused independently supported scoreboard sides after rejecting a likely "
+                        "truncated single-digit side: "
+                        f"left={left_value} ({left_evidence['count']} reads), "
+                        f"right={right_value} ({right_evidence['count']} reads)."
+                    ],
+                )
+            )
+
+        reconciled_checkpoints = [*checkpoints, *component_fusions]
         readable = [
             checkpoint
-            for checkpoint in checkpoints
+            for checkpoint in reconciled_checkpoints
             if checkpoint.visible
             and checkpoint.left_score is not None
             and checkpoint.right_score is not None
             and checkpoint.confidence >= 0.65
+            and not (
+                max(int(checkpoint.left_score), int(checkpoint.right_score)) >= 30
+                and min(int(checkpoint.left_score), int(checkpoint.right_score)) < 10
+            )
         ]
         grouped: Dict[float, List[ScoreboardCheckpointResponse]] = defaultdict(list)
         for checkpoint in readable:
             grouped[round(checkpoint.time_sec, 1)].append(checkpoint)
 
-        consensus: List[tuple[ScoreboardCheckpointResponse, int, float]] = []
+        consensus: List[tuple[ScoreboardCheckpointResponse, int, float, int]] = []
+        consensus_keys: set[tuple[float, int, int]] = set()
         notes: List[str] = []
         for time_sec, group in sorted(grouped.items()):
             pair_counts = Counter((item.left_score, item.right_score) for item in group)
             pair, count = pair_counts.most_common(1)[0]
+            matches = [item for item in group if (item.left_score, item.right_score) == pair]
             if count < 2:
                 continue
-            matches = [item for item in group if (item.left_score, item.right_score) == pair]
             chosen = max(matches, key=lambda item: item.confidence)
             average_confidence = sum(item.confidence for item in matches) / len(matches)
-            consensus.append((chosen, count, average_confidence))
+            consensus.append((chosen, count, average_confidence, 1))
+            consensus_keys.add((time_sec, int(pair[0]), int(pair[1])))
             notes.append(f"Burst consensus at t={time_sec:.1f}s: {pair[0]}-{pair[1]} from {count} reads.")
+
+        for checkpoint in readable:
+            key = (
+                round(checkpoint.time_sec, 1),
+                int(checkpoint.left_score),
+                int(checkpoint.right_score),
+            )
+            strong_component_fusion = (
+                checkpoint.source == "scoreboard_component_fusion_v1"
+                and checkpoint.confidence >= 0.8
+            )
+            if (
+                key in consensus_keys
+                or (
+                    not strong_component_fusion
+                    and (
+                        not checkpoint.source.startswith("rapidocr_scoreboard")
+                        or checkpoint.confidence < 0.98
+                    )
+                )
+            ):
+                continue
+            consensus.append((checkpoint, 1, checkpoint.confidence, 1))
+            consensus_keys.add(key)
+            notes.append(
+                f"Position/color-validated OCR candidate at t={checkpoint.time_sec:.1f}s: "
+                f"{checkpoint.left_score}-{checkpoint.right_score} confidence={checkpoint.confidence:.3f}."
+            )
+
+        by_pair: Dict[tuple[int, int], List[ScoreboardCheckpointResponse]] = defaultdict(list)
+        for checkpoint in readable:
+            pair = (int(checkpoint.left_score), int(checkpoint.right_score))
+            by_pair[pair].append(checkpoint)
+        for pair, matches in by_pair.items():
+            anchors = sorted({round(item.time_sec, 1) for item in matches})
+            if len(anchors) < 2 or anchors[-1] - anchors[-2] > 45.0:
+                continue
+            recent_anchors = {anchors[-2], anchors[-1]}
+            independent_matches = [item for item in matches if round(item.time_sec, 1) in recent_anchors]
+            chosen = max(independent_matches, key=lambda item: (item.time_sec, item.confidence))
+            average_confidence = sum(item.confidence for item in independent_matches) / len(independent_matches)
+            consensus.append((chosen, len(independent_matches), average_confidence, len(recent_anchors)))
+            notes.append(
+                f"Cross-anchor consensus at t={anchors[-2]:.1f}s and t={anchors[-1]:.1f}s: "
+                f"{pair[0]}-{pair[1]}."
+            )
 
         if not consensus:
             status = "inconsistent_scoreboard" if readable else "no_readable_scoreboard"
@@ -1342,20 +2150,57 @@ class AnalysisService:
             return ScoreboardSummaryResponse(
                 enabled=True,
                 status=status,
-                method="vlm_scoreboard_burst_audit_v2",
-                checkpoints=checkpoints,
+                method="vlm_scoreboard_burst_audit_v3",
+                checkpoints=reconciled_checkpoints,
                 notes=notes,
             )
 
         consensus.sort(key=lambda item: item[0].time_sec)
+        untruncated_consensus: List[tuple[ScoreboardCheckpointResponse, int, float, int]] = []
+        for candidate in consensus:
+            checkpoint = candidate[0]
+            truncated_from: Optional[ScoreboardCheckpointResponse] = None
+            for earlier, _, _, _ in untruncated_consensus:
+                left_truncated = (
+                    earlier.right_score == checkpoint.right_score
+                    and self._scoreboard_value_is_truncated(earlier.left_score, checkpoint.left_score)
+                )
+                right_truncated = (
+                    earlier.left_score == checkpoint.left_score
+                    and self._scoreboard_value_is_truncated(earlier.right_score, checkpoint.right_score)
+                )
+                if left_truncated or right_truncated:
+                    truncated_from = earlier
+                    break
+            if truncated_from is not None:
+                notes.append(
+                    f"Rejected likely truncated score at t={checkpoint.time_sec:.1f}s: "
+                    f"{checkpoint.left_score}-{checkpoint.right_score}; earlier complete score was "
+                    f"{truncated_from.left_score}-{truncated_from.right_score}."
+                )
+                continue
+            untruncated_consensus.append(candidate)
+        consensus = untruncated_consensus
+        if not consensus:
+            return ScoreboardSummaryResponse(
+                enabled=True,
+                status="inconsistent_scoreboard",
+                method="vlm_scoreboard_burst_audit_v3",
+                checkpoints=reconciled_checkpoints,
+                notes=notes,
+            )
+
         qualities: List[float] = []
-        for index, (checkpoint, count, average_confidence) in enumerate(consensus):
+        for index, (checkpoint, count, average_confidence, independent_anchors) in enumerate(consensus):
             clock_seconds = self._parse_scoreboard_clock(checkpoint.game_clock)
-            quality = count * 2.0 + average_confidence
+            quality = min(count, 2) * 1.0 + independent_anchors * 1.5 + average_confidence
+            if checkpoint.source.startswith("rapidocr_scoreboard") or checkpoint.source == "scoreboard_component_fusion_v1":
+                quality += 2.0
+                notes.append(f"Prioritized deterministic OCR evidence at t={checkpoint.time_sec:.1f}s.")
             quality += 0.75 if clock_seconds is not None else 0.0
             quality += 0.25 if checkpoint.period else 0.0
             if clock_seconds is not None:
-                for earlier, _, _ in consensus[:index]:
+                for earlier, _, _, _ in consensus[:index]:
                     earlier_clock = self._parse_scoreboard_clock(earlier.game_clock)
                     same_period = not earlier.period or not checkpoint.period or earlier.period == checkpoint.period
                     if same_period and earlier_clock is not None and clock_seconds > earlier_clock + 1.0:
@@ -1365,43 +2210,137 @@ class AnalysisService:
                             f"from {earlier_clock:.1f}s to {clock_seconds:.1f}s."
                         )
                         break
+            if independent_anchors == 1:
+                for earlier, _, _, _ in consensus[:index]:
+                    if earlier.time_sec >= checkpoint.time_sec:
+                        continue
+                    if (
+                        checkpoint.left_score < earlier.left_score
+                        or checkpoint.right_score < earlier.right_score
+                    ):
+                        continue
+                    elapsed = max(0.0, float(checkpoint.time_sec) - float(earlier.time_sec))
+                    max_jump = max(
+                        int(checkpoint.left_score) - int(earlier.left_score),
+                        int(checkpoint.right_score) - int(earlier.right_score),
+                    )
+                    if max_jump <= max(8.0, elapsed * 0.5):
+                        quality += 1.0
+                        notes.append(
+                            f"Rewarded monotonic score path from t={earlier.time_sec:.1f}s "
+                            f"to t={checkpoint.time_sec:.1f}s."
+                        )
+                        break
             qualities.append(quality)
 
         strongest_index = max(range(len(consensus)), key=lambda index: qualities[index])
         final = consensus[strongest_index][0]
-        strongest_quality = qualities[strongest_index]
+        final_quality = qualities[strongest_index]
         for index in range(strongest_index + 1, len(consensus)):
             candidate = consensus[index][0]
             non_decreasing = (
                 candidate.left_score >= final.left_score and candidate.right_score >= final.right_score
             )
-            if non_decreasing:
+            elapsed = max(0.0, float(candidate.time_sec) - float(final.time_sec))
+            left_jump = int(candidate.left_score) - int(final.left_score)
+            right_jump = int(candidate.right_score) - int(final.right_score)
+            plausible_jump = max(left_jump, right_jump) <= max(8.0, elapsed * 0.5)
+            if non_decreasing and plausible_jump:
                 final = candidate
+                final_quality = qualities[index]
                 continue
-            if abs(qualities[index] - strongest_quality) < 0.2:
+            if non_decreasing:
+                notes.append(
+                    f"Ignored weak or implausible later consensus at t={candidate.time_sec:.1f}s: "
+                    f"{candidate.left_score}-{candidate.right_score}."
+                )
+                continue
+            if abs(qualities[index] - final_quality) < 0.2:
                 notes.append("Rejected final score because equally supported cross-time consensuses conflict.")
                 return ScoreboardSummaryResponse(
                     enabled=True,
                     status="inconsistent_scoreboard",
-                    method="vlm_scoreboard_burst_audit_v2",
-                    checkpoints=checkpoints,
+                    method="vlm_scoreboard_burst_audit_v3",
+                    checkpoints=reconciled_checkpoints,
                     notes=notes,
                 )
             notes.append(
                 f"Ignored lower-quality non-monotonic consensus at t={candidate.time_sec:.1f}s: "
                 f"{candidate.left_score}-{candidate.right_score}."
             )
+        earlier_consensus = [
+            candidate[0]
+            for candidate in consensus
+            if candidate[0].time_sec < final.time_sec - 1.0
+        ]
+        final_independent_anchors = max(
+            (
+                candidate[3]
+                for candidate in consensus
+                if candidate[0].time_sec == final.time_sec
+                and candidate[0].left_score == final.left_score
+                and candidate[0].right_score == final.right_score
+            ),
+            default=1,
+        )
+        if final_independent_anchors < 2 and earlier_consensus and not any(
+            self._scoreboard_transition_is_plausible(earlier, final)
+            for earlier in earlier_consensus
+        ):
+            notes.append(
+                f"Rejected late OCR consensus at t={final.time_sec:.1f}s because it has no "
+                "monotonic, plausible-rate path from earlier scoreboard evidence."
+            )
+            return ScoreboardSummaryResponse(
+                enabled=True,
+                status="inconsistent_scoreboard",
+                method="vlm_scoreboard_burst_audit_v3",
+                checkpoints=reconciled_checkpoints,
+                notes=notes,
+            )
         return ScoreboardSummaryResponse(
             enabled=True,
             status="ok",
-            method="vlm_scoreboard_burst_audit_v2",
+            method="vlm_scoreboard_burst_audit_v3",
             final_left_score=final.left_score,
             final_right_score=final.right_score,
             final_total_points=int(final.left_score) + int(final.right_score),
             final_time_sec=final.time_sec,
-            checkpoints=checkpoints,
+            checkpoints=reconciled_checkpoints,
             notes=notes,
         )
+
+    def _scoreboard_transition_is_plausible(
+        self,
+        earlier: ScoreboardCheckpointResponse,
+        later: ScoreboardCheckpointResponse,
+    ) -> bool:
+        if (
+            earlier.left_score is None
+            or earlier.right_score is None
+            or later.left_score is None
+            or later.right_score is None
+            or later.time_sec <= earlier.time_sec
+        ):
+            return False
+        left_jump = int(later.left_score) - int(earlier.left_score)
+        right_jump = int(later.right_score) - int(earlier.right_score)
+        if left_jump < 0 or right_jump < 0:
+            return False
+        elapsed = float(later.time_sec) - float(earlier.time_sec)
+        return (
+            max(left_jump, right_jump) <= max(8.0, elapsed * 0.25)
+            and left_jump + right_jump <= max(12.0, elapsed * 0.35)
+        )
+
+    def _scoreboard_value_is_truncated(self, earlier_value: int, later_value: int) -> bool:
+        earlier = int(earlier_value)
+        later = int(later_value)
+        if earlier < 100 or later < 10 or later >= 100 or later >= earlier:
+            return False
+        earlier_text = str(earlier)
+        later_text = str(later)
+        return earlier_text.startswith(later_text) or earlier_text.endswith(later_text)
 
     def _parse_scoreboard_clock(self, value: str) -> Optional[float]:
         text = str(value or "").strip()
@@ -1511,6 +2450,7 @@ class AnalysisService:
             weights=embedding_weights,
             device=embedding_device,
         )
+        face_identity_adapter = self._get_face_identity_adapter()
         player_count = len(player_boxes[0]) if player_boxes[0] else 0
         if player_count == 0:
             return []
@@ -1520,6 +2460,7 @@ class AnalysisService:
         for player in range(player_count):
             means: List[np.ndarray] = []
             crops: List[np.ndarray] = []
+            face_crops: List[np.ndarray] = []
             centers: List[List[float]] = []
             sampled_boxes: List[Dict[str, float]] = []
             valid_frames = 0
@@ -1545,7 +2486,18 @@ class AnalysisService:
                 hsv = cv2.cvtColor(crop_summary, cv2.COLOR_BGR2HSV)
                 bgr_mean = crop_summary.reshape(-1, 3).mean(axis=0)
                 hsv_mean = hsv.reshape(-1, 3).mean(axis=0)
+                torso = crop[
+                    int(crop.shape[0] * 0.20) : max(1, int(crop.shape[0] * 0.70)),
+                    int(crop.shape[1] * 0.18) : max(1, int(crop.shape[1] * 0.82)),
+                ]
+                torso_small = cv2.resize(torso if torso.size else crop, (16, 16), interpolation=cv2.INTER_AREA)
+                torso_hsv = cv2.cvtColor(torso_small, cv2.COLOR_BGR2HSV)
+                torso_value = torso_hsv[:, :, 2].astype(np.float32) / 255.0
+                torso_luma = cv2.cvtColor(torso_small, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
                 crops.append(crop)
+                face_crop = self._detect_face_crop(crop)
+                if face_crop is not None:
+                    face_crops.append(face_crop)
                 sampled_boxes.append(
                     {
                         "frame": float(frame_offset + frame_index),
@@ -1566,6 +2518,9 @@ class AnalysisService:
                             float(bgr_mean[0]) / 255.0,
                             float(bgr_mean[1]) / 255.0,
                             float(bgr_mean[2]) / 255.0,
+                            float(torso_value.mean()),
+                            float(torso_luma.mean()),
+                            float((torso_value < 0.42).mean()),
                         ],
                         dtype=np.float32,
                     )
@@ -1578,6 +2533,16 @@ class AnalysisService:
             signature = np.stack(means, axis=0).mean(axis=0)
             embedding_result = embedder.embed_crops(crops)
             embedding = embedding_result.embedding
+            face_identity_result = (
+                face_identity_adapter.embed_player_crops(crops)
+                if face_identity_adapter is not None
+                else None
+            )
+            face_embedding_result = (
+                embedder.embed_crops(face_crops)
+                if face_identity_adapter is None and face_crops
+                else None
+            )
             jersey_number_candidates = []
             if jersey_number_verifier is not None:
                 jersey_frames = self._select_jersey_number_frames(crops, jersey_number_frames)
@@ -1601,10 +2566,37 @@ class AnalysisService:
                         "b_mean": float(signature[3]),
                         "g_mean": float(signature[4]),
                         "r_mean": float(signature[5]),
+                        "torso_v_mean": float(signature[6]),
+                        "torso_luma_mean": float(signature[7]),
+                        "jersey_dark_ratio": float(signature[8]),
                     },
                     appearance_embedding=[float(value) for value in embedding.tolist()],
                     embedding_model=embedding_result.model_id,
                     embedding_dim=int(embedding.shape[0]),
+                    face_embedding=(
+                        [float(value) for value in face_identity_result.embedding.tolist()]
+                        if face_identity_result is not None
+                        else [float(value) for value in face_embedding_result.embedding.tolist()]
+                        if face_embedding_result is not None
+                        else []
+                    ),
+                    face_embedding_model=(
+                        face_identity_result.model_id
+                        if face_identity_result is not None
+                        else f"opencv_haar_face+{face_embedding_result.model_id}"
+                        if face_embedding_result is not None
+                        else None
+                    ),
+                    face_sample_count=(
+                        face_identity_result.sample_count
+                        if face_identity_result is not None
+                        else len(face_crops)
+                    ),
+                    face_embedding_quality=(
+                        face_identity_result.quality
+                        if face_identity_result is not None
+                        else 0.0
+                    ),
                     track_coverage=valid_frames / max(1, (len(video_frames) + sample_stride - 1) // sample_stride),
                     method=embedding_result.method,
                     sampled_boxes=sampled_boxes,
@@ -1612,6 +2604,36 @@ class AnalysisService:
                 )
             )
         return features
+
+    def _detect_face_crop(self, player_crop: np.ndarray) -> Optional[np.ndarray]:
+        """Return the strongest frontal-face crop, or None for the normal clothing fallback."""
+        if player_crop.size == 0 or min(player_crop.shape[:2]) < 24:
+            return None
+        if self._face_cascade is None:
+            cascade_path = str(Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml")
+            self._face_cascade = cv2.CascadeClassifier(cascade_path)
+        if self._face_cascade.empty():
+            return None
+        upper = player_crop[: max(1, int(player_crop.shape[0] * 0.58))]
+        gray = cv2.cvtColor(upper, cv2.COLOR_BGR2GRAY)
+        min_side = max(18, int(min(upper.shape[:2]) * 0.16))
+        faces = self._face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=4,
+            minSize=(min_side, min_side),
+        )
+        if len(faces) == 0:
+            return None
+        x, y, width, height = max(faces, key=lambda box: int(box[2]) * int(box[3]))
+        margin_x = int(width * 0.12)
+        margin_y = int(height * 0.12)
+        left = max(0, x - margin_x)
+        top = max(0, y - margin_y)
+        right = min(upper.shape[1], x + width + margin_x)
+        bottom = min(upper.shape[0], y + height + margin_y)
+        face = upper[top:bottom, left:right]
+        return face if face.size else None
 
     def _select_jersey_number_frames(
         self,
@@ -1652,6 +2674,24 @@ class AnalysisService:
             )
             self._identity_embedder_key = key
         return self._identity_embedder
+
+    def _get_face_identity_adapter(self) -> Optional[OpenCvSFaceIdentityAdapter]:
+        backend = str(getattr(self.settings, "face_identity_backend", "opencv_sface_if_available"))
+        detector_path = str(getattr(self.settings, "face_detection_model_path", ""))
+        recognizer_path = str(getattr(self.settings, "face_recognition_model_path", ""))
+        score_threshold = float(getattr(self.settings, "face_detection_score_threshold", 0.60))
+        allow_fallback = bool(getattr(self.settings, "face_identity_allow_fallback", True))
+        key = (backend, detector_path, recognizer_path, score_threshold, allow_fallback)
+        if self._face_identity_adapter_key != key:
+            self._face_identity_adapter = build_face_identity_adapter(
+                backend=backend,
+                detector_model_path=detector_path,
+                recognizer_model_path=recognizer_path,
+                score_threshold=score_threshold,
+                allow_fallback=allow_fallback,
+            )
+            self._face_identity_adapter_key = key
+        return self._face_identity_adapter
 
     def _crop_identity_embedding(self, crop_bgr: np.ndarray) -> np.ndarray:
         """Generate a sidecar appearance embedding from a player crop.
@@ -1706,13 +2746,23 @@ class AnalysisService:
         )
         for summary in sorted_summaries:
             segment_id, local_index = self._parse_segment_player_id(summary.player_id)
-            best_candidate: Optional[tuple[float, str, str, float, float, float, float]] = None
+            best_candidate: Optional[
+                tuple[float, str, str, float, float, float, float, Optional[float], float]
+            ] = None
             for global_player_id, (previous_segment, previous_player_id, previous_actions) in last_by_global_id.items():
                 if segment_id <= previous_segment or segment_id - previous_segment > 1:
                     continue
                 previous_local_index = self._parse_segment_player_id(previous_player_id)[1]
                 action_similarity = self._action_similarity(previous_actions, summary.action_counts)
                 appearance_similarity = self._appearance_similarity(
+                    player_identity_features.get(previous_player_id),
+                    player_identity_features.get(summary.player_id),
+                )
+                face_similarity = self._face_similarity(
+                    player_identity_features.get(previous_player_id),
+                    player_identity_features.get(summary.player_id),
+                )
+                jersey_dark_gap = self._jersey_dark_gap(
                     player_identity_features.get(previous_player_id),
                     player_identity_features.get(summary.player_id),
                 )
@@ -1726,12 +2776,50 @@ class AnalysisService:
                     and summary.player_id in player_identity_features
                 )
                 if has_identity_features:
-                    score = (
-                        action_similarity * 0.25
-                        + appearance_similarity * 0.35
-                        + continuity_similarity * 0.30
-                        + local_index_bonus * 0.10
-                    )
+                    previous_feature = player_identity_features.get(previous_player_id)
+                    current_feature = player_identity_features.get(summary.player_id)
+                    has_overlap = self._has_identity_time_overlap(previous_feature, current_feature)
+                    has_timed_boxes = self._has_timed_identity_boxes(previous_feature, current_feature)
+                    if has_overlap:
+                        if continuity_similarity < 0.55:
+                            continue
+                        if (
+                            min(previous_feature.track_coverage, current_feature.track_coverage) < 0.15
+                            and continuity_similarity < 0.75
+                        ):
+                            continue
+                        score = (
+                            action_similarity * 0.05
+                            + appearance_similarity * 0.25
+                            + continuity_similarity * 0.65
+                            + local_index_bonus * 0.05
+                        )
+                    elif has_timed_boxes:
+                        # Adjacent segment tracks do not always survive into the
+                        # overlap window.  In that case, timed boxes alone cannot
+                        # provide continuity evidence, but a high-quality SFace
+                        # match corroborated by the same jersey darkness can.
+                        # Keep this deliberately narrow so similarly dressed
+                        # teammates are not merged from body appearance alone.
+                        if (
+                            face_similarity is None
+                            or face_similarity < 0.55
+                            or jersey_dark_gap > 0.20
+                        ):
+                            continue
+                        score = (
+                            face_similarity * 0.65
+                            + appearance_similarity * 0.20
+                            + action_similarity * 0.10
+                            + local_index_bonus * 0.05
+                        )
+                    else:
+                        score = (
+                            action_similarity * 0.15
+                            + appearance_similarity * 0.55
+                            + continuity_similarity * 0.20
+                            + local_index_bonus * 0.10
+                        )
                 else:
                     score = action_similarity * 0.75 + local_index_bonus * 0.25
                 if best_candidate is None or score > best_candidate[0]:
@@ -1743,10 +2831,22 @@ class AnalysisService:
                         appearance_similarity,
                         continuity_similarity,
                         local_index_bonus,
+                        face_similarity,
+                        jersey_dark_gap,
                     )
 
-            if best_candidate is not None and best_candidate[0] >= 0.45:
-                score, global_player_id, previous_player_id, action_similarity, appearance_similarity, continuity_similarity, local_index_bonus = best_candidate
+            if best_candidate is not None and best_candidate[0] >= 0.55:
+                (
+                    score,
+                    global_player_id,
+                    previous_player_id,
+                    action_similarity,
+                    appearance_similarity,
+                    continuity_similarity,
+                    local_index_bonus,
+                    face_similarity,
+                    jersey_dark_gap,
+                ) = best_candidate
                 confidence = min(0.90, max(0.45, score))
                 identity_map[summary.player_id] = global_player_id
                 identity_confidences[summary.player_id] = confidence
@@ -1754,6 +2854,12 @@ class AnalysisService:
                     f"stitched from {previous_player_id}",
                     f"combined identity score {score:.2f}",
                     f"embedding similarity {appearance_similarity:.2f}",
+                    (
+                        f"SFace similarity {face_similarity:.2f}"
+                        if face_similarity is not None
+                        else "SFace similarity unavailable"
+                    ),
+                    f"jersey darkness gap {jersey_dark_gap:.2f}",
                     f"track continuity {continuity_similarity:.2f}",
                     f"action similarity {action_similarity:.2f}",
                     f"same local index bonus {local_index_bonus:.0f}",
@@ -1779,18 +2885,83 @@ class AnalysisService:
     ) -> float:
         if left is None or right is None:
             return 0.0
+        body_similarity: Optional[float] = None
         if left.appearance_embedding and right.appearance_embedding:
             left_values = np.array(left.appearance_embedding, dtype=np.float32)
             right_values = np.array(right.appearance_embedding, dtype=np.float32)
             if left_values.shape == right_values.shape and left_values.size > 0:
                 denominator = float(np.linalg.norm(left_values) * np.linalg.norm(right_values))
                 if denominator > 0.0:
-                    return max(0.0, min(1.0, float(np.dot(left_values, right_values) / denominator)))
+                    body_similarity = max(0.0, min(1.0, float(np.dot(left_values, right_values) / denominator)))
+        face_similarity = self._face_similarity(left, right)
+        if body_similarity is not None:
+            uses_sface = bool(
+                face_similarity is not None
+                and left.face_embedding_model
+                and right.face_embedding_model
+                and "sface" in left.face_embedding_model.lower()
+                and "sface" in right.face_embedding_model.lower()
+            )
+            if face_similarity is None:
+                combined = body_similarity
+            elif uses_sface:
+                combined = body_similarity * 0.35 + face_similarity * 0.65
+                if face_similarity < 0.50:
+                    combined = min(combined, 0.40)
+            else:
+                combined = body_similarity * 0.65 + face_similarity * 0.35
+            dark_gap = self._jersey_dark_gap(left, right)
+            if dark_gap >= 0.35:
+                combined = min(combined, 0.35)
+            return combined
         keys = ["h_mean", "s_mean", "v_mean", "b_mean", "g_mean", "r_mean"]
         left_values = np.array([left.appearance_signature.get(key, 0.0) for key in keys], dtype=np.float32)
         right_values = np.array([right.appearance_signature.get(key, 0.0) for key in keys], dtype=np.float32)
         distance = float(np.linalg.norm(left_values - right_values))
         return max(0.0, min(1.0, 1.0 - distance / 1.75))
+
+    def _face_similarity(
+        self,
+        left: Optional[PlayerIdentityFeatureResponse],
+        right: Optional[PlayerIdentityFeatureResponse],
+    ) -> Optional[float]:
+        if (
+            left is None
+            or right is None
+            or left.face_sample_count <= 0
+            or right.face_sample_count <= 0
+            or not left.face_embedding
+            or not right.face_embedding
+        ):
+            return None
+        uses_sface = bool(
+            left.face_embedding_model
+            and right.face_embedding_model
+            and "sface" in left.face_embedding_model.lower()
+            and "sface" in right.face_embedding_model.lower()
+        )
+        if uses_sface and min(left.face_embedding_quality, right.face_embedding_quality) < 0.50:
+            return None
+        left_face = np.array(left.face_embedding, dtype=np.float32)
+        right_face = np.array(right.face_embedding, dtype=np.float32)
+        if left_face.shape != right_face.shape or left_face.size == 0:
+            return None
+        denominator = float(np.linalg.norm(left_face) * np.linalg.norm(right_face))
+        if denominator <= 0.0:
+            return None
+        return max(0.0, min(1.0, float(np.dot(left_face, right_face) / denominator)))
+
+    def _jersey_dark_gap(
+        self,
+        left: Optional[PlayerIdentityFeatureResponse],
+        right: Optional[PlayerIdentityFeatureResponse],
+    ) -> float:
+        if left is None or right is None:
+            return 1.0
+        return abs(
+            left.appearance_signature.get("jersey_dark_ratio", 0.5)
+            - right.appearance_signature.get("jersey_dark_ratio", 0.5)
+        )
 
     def _track_continuity_similarity(
         self,
@@ -1799,10 +2970,69 @@ class AnalysisService:
     ) -> float:
         if left is None or right is None or not left.last_center or not right.first_center:
             return 0.0
+        overlap_scores: List[float] = []
+        for left_box in left.sampled_boxes:
+            left_time = left_box.get("time_sec")
+            if left_time is None:
+                continue
+            for right_box in right.sampled_boxes:
+                right_time = right_box.get("time_sec")
+                if right_time is None or abs(float(left_time) - float(right_time)) > 0.20:
+                    continue
+                left_center = np.array([left_box.get("cx", 0.0), left_box.get("cy", 0.0)], dtype=np.float32)
+                right_center = np.array([right_box.get("cx", 0.0), right_box.get("cy", 0.0)], dtype=np.float32)
+                center_similarity = max(
+                    0.0,
+                    1.0 - float(np.linalg.norm(left_center - right_center)) / 250.0,
+                )
+                overlap_scores.append(
+                    self._identity_box_iou(left_box, right_box) * 0.70 + center_similarity * 0.30
+                )
+        if overlap_scores:
+            overlap_scores.sort(reverse=True)
+            return sum(overlap_scores[:2]) / min(2, len(overlap_scores))
         dx = float(left.last_center[0]) - float(right.first_center[0])
         dy = float(left.last_center[1]) - float(right.first_center[1])
         distance = (dx * dx + dy * dy) ** 0.5
         return max(0.0, min(1.0, 1.0 - distance / 900.0))
+
+    def _has_identity_time_overlap(
+        self,
+        left: Optional[PlayerIdentityFeatureResponse],
+        right: Optional[PlayerIdentityFeatureResponse],
+    ) -> bool:
+        if left is None or right is None:
+            return False
+        left_times = [float(box["time_sec"]) for box in left.sampled_boxes if "time_sec" in box]
+        right_times = [float(box["time_sec"]) for box in right.sampled_boxes if "time_sec" in box]
+        return any(abs(left_time - right_time) <= 0.20 for left_time in left_times for right_time in right_times)
+
+    def _has_timed_identity_boxes(
+        self,
+        left: Optional[PlayerIdentityFeatureResponse],
+        right: Optional[PlayerIdentityFeatureResponse],
+    ) -> bool:
+        if left is None or right is None:
+            return False
+        return (
+            any("time_sec" in box for box in left.sampled_boxes)
+            and any("time_sec" in box for box in right.sampled_boxes)
+        )
+
+    def _identity_box_iou(self, left: Dict[str, float], right: Dict[str, float]) -> float:
+        left_x2 = float(left.get("x", 0.0)) + float(left.get("w", 0.0))
+        left_y2 = float(left.get("y", 0.0)) + float(left.get("h", 0.0))
+        right_x2 = float(right.get("x", 0.0)) + float(right.get("w", 0.0))
+        right_y2 = float(right.get("y", 0.0)) + float(right.get("h", 0.0))
+        intersection_width = max(0.0, min(left_x2, right_x2) - max(float(left.get("x", 0.0)), float(right.get("x", 0.0))))
+        intersection_height = max(0.0, min(left_y2, right_y2) - max(float(left.get("y", 0.0)), float(right.get("y", 0.0))))
+        intersection = intersection_width * intersection_height
+        union = (
+            float(left.get("w", 0.0)) * float(left.get("h", 0.0))
+            + float(right.get("w", 0.0)) * float(right.get("h", 0.0))
+            - intersection
+        )
+        return intersection / union if union > 0.0 else 0.0
 
     def _detect_identity_duplicate_candidates(
         self,

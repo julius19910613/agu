@@ -1,0 +1,24 @@
+{
+  "records": [
+    {
+      "start_frame": 25,
+      "end_frame": 35,
+      "global_player_id": "player_001",
+      "final": {"action": "shoot", "confidence": 0.92, "source": "fixture"}
+    },
+    {
+      "start_frame": 70,
+      "end_frame": 80,
+      "global_player_id": "player_002",
+      "final": {"action": "pass", "confidence": 0.88, "source": "fixture"}
+    }
+  ],
+  "long_video": {
+    "fps": 30.0,
+    "scoreboard_summary": {
+      "status": "ok",
+      "final_left_score": 21,
+      "final_right_score": 19
+    }
+  }
+}

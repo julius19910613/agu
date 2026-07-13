@@ -392,7 +392,7 @@ class OllamaVLMVerifier:
         return ScoreboardSummaryResponse(
             enabled=True,
             status=status,
-            method="vlm_scoreboard_burst_audit_v2",
+            method="vlm_scoreboard_burst_audit_v3",
             final_left_score=final.left_score if final else None,
             final_right_score=final.right_score if final else None,
             final_total_points=(
@@ -585,9 +585,20 @@ class OllamaVLMVerifier:
             "Read only numbers that are visibly on the scoreboard. Do not infer a score from game action. "
             "The large green or cyan digits directly under the left team label (often A or A队) are left_score. "
             "The large green or cyan digits directly under the right team label (often B or B队) are right_score. "
+            "A team's multi-digit score may be laid out horizontally OR vertically. When two or three large "
+            "cyan digits are stacked in one team's side region, concatenate them from top to bottom as that "
+            "team's score (for example a 6 above a 9 on the left means left_score 69, and a 5 above a 2 "
+            "on the right means right_score 52). Never combine digits across the left and right team regions. "
             "Do not confuse the smaller central yellow game clock, period, timeout, or foul counters with either score. "
             "Scores can have one, two, or three digits. Preserve every visible leading hundreds or tens digit, "
             "for example read 120 as 120, never 20. "
+            "Rolling-shutter frames may turn the cyan digits into one continuous horizontal bright bar. "
+            "A bright bar is not a readable number: mark visible false unless separate digit strokes are visible "
+            "on both the left and right score regions. "
+            "When the scope says same-anchor rolling-shutter phase comparison, all images show the same board "
+            "within one short burst. Compare complementary dark gaps and lit segments jointly. If the combined "
+            "phases consistently reveal one score pair, return that pair for at least two supporting sample indices; "
+            "otherwise keep every ambiguous sample unreadable. "
             "If a scoreboard is not visible or too blurry for a sample, mark visible false and leave scores null. "
             "Return only compact JSON with key checkpoints. checkpoints must be an array of objects with keys: "
             "index, visible, left_score, right_score, period, game_clock, confidence, notes. "
@@ -674,7 +685,7 @@ def _parse_scoreboard_checkpoints(
             period=str(item.get("period") or "").strip() or None,
             game_clock=str(item.get("game_clock") or "").strip(),
             confidence=clamp_float(item.get("confidence"), 0.0, 1.0, default=0.0),
-            source="vlm_scoreboard_burst_audit_v2",
+            source="vlm_scoreboard_burst_audit_v3",
             notes=_string_list(item.get("notes")),
             raw_response=raw_response,
         )

@@ -146,6 +146,10 @@ class PlayerIdentityFeatureResponse(BaseModel):
     appearance_embedding: List[float] = Field(default_factory=list)
     embedding_model: str = "sidecar_hsv_hist_embedding_v1"
     embedding_dim: int = 0
+    face_embedding: List[float] = Field(default_factory=list)
+    face_embedding_model: Optional[str] = None
+    face_sample_count: int = 0
+    face_embedding_quality: float = 0.0
     track_coverage: float = 0.0
     method: str = "sidecar_hsv_hist_embedding_v1"
     sampled_boxes: List[Dict[str, float]] = Field(default_factory=list)
@@ -238,7 +242,7 @@ class ScoreboardCheckpointResponse(BaseModel):
     period: Optional[str] = None
     game_clock: str = ""
     confidence: float = 0.0
-    source: str = "vlm_scoreboard_burst_audit_v2"
+    source: str = "vlm_scoreboard_burst_audit_v3"
     notes: List[str] = Field(default_factory=list)
     raw_response: str = ""
 
@@ -246,7 +250,7 @@ class ScoreboardCheckpointResponse(BaseModel):
 class ScoreboardSummaryResponse(BaseModel):
     enabled: bool = False
     status: str = "disabled"
-    method: str = "vlm_scoreboard_burst_audit_v2"
+    method: str = "vlm_scoreboard_burst_audit_v3"
     final_left_score: Optional[int] = None
     final_right_score: Optional[int] = None
     final_total_points: Optional[int] = None
@@ -319,6 +323,11 @@ class AnalysisRequest(BaseModel):
     r2plus1d_device: Optional[str] = Field(default=None, description="Optional R(2+1)D device override: auto, cpu, cuda, mps, or mps_if_available.")
     low_confidence: Optional[float] = Field(default=None, description="Override default low_confidence threshold.")
     high_confidence: Optional[float] = Field(default=None, description="Override default high_confidence threshold.")
+    max_runtime_sec: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Optional cooperative analysis deadline in seconds; 0 disables the deadline.",
+    )
     segmented_analysis: bool = Field(default=True, description="If True, analyze videos through unified overlapped segments.")
     long_video_mode: bool = Field(default=False, description="If True, run segmented long-video analysis with VLM audit.")
     segment_duration_sec: float = Field(default=15.0, description="Long-video segment duration in seconds.")
@@ -336,6 +345,8 @@ class AnalysisRequest(BaseModel):
 
 class AnalysisResponse(BaseModel):
     """Full payload returned from a successful analysis."""
+    schema_version: str = "1.0"
+    pipeline_manifest: Dict[str, Any] = Field(default_factory=dict)
     video: str
     created_at_unix: float
     runtime_seconds: float
@@ -363,7 +374,10 @@ class AnalysisRunAsyncResponse(BaseModel):
 
 class AnalysisTaskStatusResponse(BaseModel):
     task_id: str
+    request_id: Optional[str] = None
     status: str
     progress: int
     error: Optional[str] = None
     result: Optional[AnalysisResponse] = None
+    created_at_unix: Optional[float] = None
+    updated_at_unix: Optional[float] = None

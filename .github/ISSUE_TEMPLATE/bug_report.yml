@@ -1,0 +1,29 @@
+name: Bug report
+description: Report a reproducible AGU defect
+title: "bug: "
+body:
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Do not attach private video, secrets, or model weights.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: AGU version
+      placeholder: "agu --version"
+    validations:
+      required: true
+  - type: textarea
+    id: plugins
+    attributes:
+      label: Plugin diagnostics
+      placeholder: "agu plugins doctor"

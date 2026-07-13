@@ -88,6 +88,8 @@ Aliases:
 ```http
 GET /api/v1/analysis/tasks/{task_id}
 GET /api/v1/analysis/tasks/{task_id}/result
+POST /api/v1/analysis/tasks/{task_id}/cancel
+POST /api/v1/analysis/tasks/{task_id}/retry
 ```
 
 Response body:
@@ -99,6 +101,16 @@ Response body:
   "progress": 100,
   "error": null,
   "result": {
+    "schema_version": "1.0",
+    "pipeline_manifest": {
+      "pipeline_version": "1",
+      "stages": [
+        {"stage": "analysis.validate", "status": "completed", "duration_ms": 0.01},
+        {"stage": "analysis.dispatch", "status": "completed", "duration_ms": 12.3},
+        {"stage": "analysis.finalize", "status": "completed", "duration_ms": 0.01}
+      ],
+      "metadata": {"schema_version": "1.0", "segmented_analysis": false}
+    },
     "video": "examples/lebron_shoots.mp4",
     "created_at_unix": 1765890000.0,
     "runtime_seconds": 12.34,
@@ -122,6 +134,19 @@ Response body:
 }
 ```
 
+Task status also includes `request_id`, `created_at_unix`, and
+`updated_at_unix`. Cancellation is cooperative: AGU stops at the next pipeline
+progress boundary and preserves `status=cancelled`; a completed/failed task is
+not rewritten. `retry` creates a new task from the stored request and is allowed
+only for failed or cancelled in-memory tasks. Task requests/results remain
+in-memory and are lost after process restart.
+
+`max_runtime_sec` sets a per-request cooperative deadline. When omitted,
+`BASKETBALL_ANALYSIS_TIMEOUT_SEC` is used; `0` disables it. `max_frames`,
+`max_segments`, segment bounds, and this deadline form the current resource
+budget controls. Long detector/model calls can finish before cancellation or a
+deadline is observed.
+
 For running tasks, `progress` is a best-effort integer from 0 to 100. AGU now
 updates it at major pipeline stages such as tracker setup, window cropping,
 R(2+1)D inference, fusion/VLM verification, identity extraction, segment audit,
@@ -129,6 +154,12 @@ and post-processing. It is intended for CLI/UI polling feedback, not as a
 durable timing contract; completed and failed tasks still finish at `100`.
 
 ## Stable Output Fields
+
+`result.schema_version` versions the stable JSON contract. Additive fields do
+not change this value; an incompatible removal or semantic change requires a
+new major schema version. `result.pipeline_manifest` records the stage names,
+status, elapsed milliseconds, and non-secret execution metadata. Durations are
+diagnostic and are not a performance SLA.
 
 `result.records[]` contains one row per player clip.
 
@@ -166,10 +197,13 @@ the optional local `torchreid` package and weights are available, with
 | `local_player_id` | string or null | Segment-local player key |
 | `start_frame` / `end_frame` | integer | Feature frame range |
 | `first_center` / `last_center` | array | First/last observed bbox centers |
-| `appearance_signature` | object | Mean HSV/RGB crop signature retained for explainability/fallback |
+| `appearance_signature` | object | Mean HSV/RGB plus torso luminance and jersey-dark-ratio signature retained for explainability/fallback |
 | `appearance_embedding` | array | Model/fallback appearance embedding used for cosine similarity |
 | `embedding_model` | string | Embedding source/model identifier |
 | `embedding_dim` | integer | Embedding vector length |
+| `face_embedding` | array | Optional embedding of OpenCV-detected frontal-face crops; empty when no usable face is visible |
+| `face_embedding_model` | string or null | Face detector plus configured embedding backend identifier |
+| `face_sample_count` | integer | Number of sampled player crops with a usable frontal face |
 | `track_coverage` | number | Fraction of sampled frames with usable boxes |
 | `method` | string | Feature extraction method |
 | `sampled_boxes` | array | Sampled frame-level boxes used for duplicate-ID conflict and overlap checks |
@@ -215,6 +249,10 @@ Important request fields:
 | `vlm_identity_merge_max_candidates` | integer or null | Maximum duplicate candidates sent to VLM for merge review |
 | `vlm_identity_merge_confidence` | number or null | Minimum VLM same-player confidence required to emit a confirmed merge |
 | `r2plus1d_device` | string or null | Optional R(2+1)D device override: `auto`, `cpu`, `cuda`, `mps`, or `mps_if_available` |
+
+Face identity is configured at service level with `BASKETBALL_FACE_IDENTITY_BACKEND`, `BASKETBALL_FACE_DETECTION_MODEL_PATH`, `BASKETBALL_FACE_RECOGNITION_MODEL_PATH`, and `BASKETBALL_FACE_DETECTION_SCORE_THRESHOLD`. The default `opencv_sface_if_available` backend uses local OpenCV YuNet and SFace ONNX models and falls back to Haar sampling when either model is unavailable.
+
+SFace output is quality-gated per local track: at least two face samples must form a majority cluster with internal cosine similarity of at least `0.50`. Unstable detections from track-ID switches, back-facing heads, or background people are omitted instead of being averaged into identity evidence. The resulting quality is exposed as `player_identity_features[].face_embedding_quality`.
 
 `result.long_video.segments[]` contains segment-level summary and VLM audit status:
 
@@ -366,10 +404,17 @@ Each `owner_candidates[]` item contains:
 | `evidence` | array | Human-readable owner-scoring evidence |
 
 Known MVP boundary: `global_player_id` is a conservative candidate generated
-from adjacent segment action, configured appearance embedding, and track-continuity
-evidence. Duplicate identity candidates are review-only until jersey number,
-VLM, or human confirmation is available. Stable cross-segment identity merging
-by jersey number and richer trajectory metadata remains a follow-up.
+from adjacent segment action, body appearance, torso/jersey luminance, optional
+frontal-face evidence, and track continuity. OpenCV Haar face detection is a
+local optional sidecar: profiles, occluded faces, and small crops fall back to
+clothing/body evidence instead of fabricating face evidence. Duplicate identity
+candidates remain review-only until jersey number, VLM, or human confirmation.
+
+Scoreboard audit uses the optional `rapidocr_if_available` backend before VLM
+fallback. Install `requirements-ocr.txt` for local offline OCR. Configure
+`BASKETBALL_SCOREBOARD_OCR_BACKEND=off|rapidocr|rapidocr_if_available` and
+`BASKETBALL_SCOREBOARD_OCR_CONFIDENCE`; OCR candidates still pass the same
+burst, cross-anchor, monotonic-score, and clock consistency reconciliation.
 
 ## Error Behavior
 
@@ -381,5 +426,6 @@ by jersey number and richer trajectory metadata remains a follow-up.
 
 - Task state is in memory and is lost when the process restarts.
 - `video_path` must be visible to the AGU process/container.
+- By default `video_path` must be under the AGU working directory. Set `BASKETBALL_ALLOWED_VIDEO_ROOTS` to a comma-separated list of additional trusted video directories.
 - AGU writes JSON output to `BASKETBALL_OUTPUT_DIR`.
 - AGU writes annotated video output to `BASKETBALL_VIDEO_OUTPUT_DIR` when `generate_video=true`.

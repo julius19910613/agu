@@ -12,6 +12,7 @@ from app.config import get_settings
 from app.models.r2plus1d import build_r2plus1d_model
 from app.dependencies import init_globals
 from app.analysis.router import router as analysis_router
+from app.version import __version__
 
 
 def resolve_model_device(preference: str) -> torch.device:
@@ -68,7 +69,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(
     title="Basketball Defense Analysis API",
     description="Hybrid Spatio-Temporal classification of basketball actions.",
-    version="1.0.0",
+    version=__version__,
     lifespan=lifespan,
 )
 

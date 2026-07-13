@@ -26,7 +26,7 @@ def test_analyze_preset_builds_accurate_payload(monkeypatch, capsys) -> None:
     assert captured["payload"]["segment_overlap_sec"] == 3.0
     assert captured["payload"]["vlm_audit_frames"] == 4
     assert captured["payload"]["scoreboard_audit"] is True
-    assert captured["payload"]["scoreboard_audit_max_frames"] == 4
+    assert captured["payload"]["scoreboard_audit_max_frames"] == 6
     assert "task-1" in capsys.readouterr().out
 
 

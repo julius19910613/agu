@@ -1,0 +1,9 @@
+[analysis]
+vlm_mode = "off"
+generate_video = false
+segmented_analysis = true
+vlm_audit = false
+tracking_fps = 6.0
+yolo_imgsz = 320
+action_vid_stride = 32
+max_players_per_segment = 10

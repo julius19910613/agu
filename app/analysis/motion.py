@@ -31,7 +31,11 @@ def compute_motion_features(
     for frame_boxes in window:
         if player < 0 or player >= len(frame_boxes):
             raise IndexError(f"Player index {player} out of bounds for frame boxes of length {len(frame_boxes)}")
-    boxes = [np.asarray(frame_boxes[player], dtype=float) for frame_boxes in window]
+    boxes = [
+        np.asarray(frame_boxes[player], dtype=float)
+        for frame_boxes in window
+        if float(frame_boxes[player][2]) > 1.0 and float(frame_boxes[player][3]) > 1.0
+    ]
     if not boxes:
         return MotionFeatures(
             avg_center_speed=0.0,
